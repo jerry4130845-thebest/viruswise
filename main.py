@@ -12,6 +12,7 @@ from utils.quarantine import quarantine
 from utils.risk import RISK_LEVEL_1, RISK_LEVEL_2, SYSTEM_CRITICAL_PATHS, SYSTEM_PROCESSES, get_risk_level
 from utils.signature import check_digital_signature
 from utils.network import is_offline
+from utils.fake_log import is_fake_log
 
 CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "crash.log")
 
@@ -329,21 +330,6 @@ class TrustedPublishers:
         'canonical ltd', 'fedora project', 'red hat', 'suse',
         'arista networks', 'broadcom', 'cisco systems',
     }
-
-def is_fake_log(filepath):
-    try:
-        if not os.path.exists(filepath) or os.path.getsize(filepath) == 0: return True
-        with open(filepath, 'rb') as f: header = f.read(1024)
-        if not header: return True
-        if header.startswith(b'MZ') or header.startswith(b'PK') or header.startswith(b'\x7fELF') or header.startswith(b'%PDF') or header.startswith(b'\xff\xd8\xff') or header.startswith(b'\x89PNG'): return True
-        try:
-            text_content = header.decode('utf-8', errors='ignore')
-            if text_content.strip():
-                log_indicators = ['[', ']', ':', 'error', 'warn', 'info', 'debug', 'log', '|', '-', '2024', '2025', '2026']
-                if any(indicator.lower() in text_content.lower() for indicator in log_indicators): return False
-            return True
-        except: return True
-    except: return False
 
 class ProcessBehavior:
     def __init__(self, pid, name, exe):
