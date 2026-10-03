@@ -7,6 +7,7 @@ from tkinter import messagebox, filedialog, ttk
 from ctypes import wintypes
 from utils.config import load_config, save_config
 from utils.whitelist import load_whitelist, save_whitelist
+from utils.hash import get_file_hash
 
 CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "crash.log")
 
@@ -172,16 +173,6 @@ def get_risk_level(filepath):
     for risk in RISK_LEVEL_2:
         if risk in filepath_lower: return 2
     return 3
-
-def get_file_hash(path):
-    try:
-        sha256 = hashlib.sha256()
-        with open(path, "rb") as f:
-            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-            sha256.update(mm)
-            mm.close()
-        return sha256.hexdigest()
-    except: return None
 
 def quarantine(path):
     try:
