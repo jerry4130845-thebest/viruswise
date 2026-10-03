@@ -45,7 +45,7 @@ def safe_get_base_dir():
     return os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__))
 
 try:
-    BASE_DIR = safe_get_base_dir()
+    from utils.paths import BASE_DIR, DATA_DIR, QUARANTINE_DIR, WHITELIST_FILE, PROFILES_DIR, CONFIG_FILE, THEME_WARM_YELLOW, CRASH_LOG
     os.chdir(BASE_DIR)
     DATA_DIR = os.path.join(BASE_DIR, "data")
     QUARANTINE_DIR = os.path.join(BASE_DIR, "quarantine")
