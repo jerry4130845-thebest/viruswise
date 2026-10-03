@@ -10,6 +10,7 @@ from utils.whitelist import load_whitelist, save_whitelist
 from utils.hash import get_file_hash
 from utils.quarantine import quarantine
 from utils.risk import RISK_LEVEL_1, RISK_LEVEL_2, SYSTEM_CRITICAL_PATHS, SYSTEM_PROCESSES, get_risk_level
+from utils.signature import check_digital_signature
 
 CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "crash.log")
 
@@ -156,21 +157,6 @@ def is_offline():
         requests.get("https://www.virustotal.com", timeout=2)
         return False
     except: return True
-
-def check_digital_signature(filepath):
-    try:
-        ps_command = f"""
-$file = '{filepath}'
-if (Test-Path $file) {{
-    $sig = Get-AuthenticodeSignature $file
-    if ($sig.Status -eq 'Valid') {{ Write-Output "Valid" }}
-    else {{ Write-Output "Invalid" }}
-}} else {{ Write-Output "NotFound" }}
-"""
-        result = subprocess.run(['powershell', '-Command', ps_command],
-                              capture_output=True, text=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW)
-        return result.stdout.strip() == "Valid"
-    except: return False
 
 class WindowsNotifier:
     def __init__(self):
