@@ -11,6 +11,7 @@ from utils.hash import get_file_hash
 from utils.quarantine import quarantine
 from utils.risk import RISK_LEVEL_1, RISK_LEVEL_2, SYSTEM_CRITICAL_PATHS, SYSTEM_PROCESSES, get_risk_level
 from utils.signature import check_digital_signature
+from utils.network import is_offline
 
 CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "crash.log")
 
@@ -151,12 +152,6 @@ def collect_files(path):
         for f in fs:
             result.append(os.path.join(r, f))
     return result
-
-def is_offline():
-    try:
-        requests.get("https://www.virustotal.com", timeout=2)
-        return False
-    except: return True
 
 class WindowsNotifier:
     def __init__(self):
