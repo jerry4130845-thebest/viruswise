@@ -6,6 +6,7 @@ import tkinter as tk
 from tkinter import messagebox, filedialog, ttk
 from ctypes import wintypes
 from utils.config import load_config, save_config
+from utils.whitelist import load_whitelist, save_whitelist
 
 CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "crash.log")
 
@@ -138,18 +139,6 @@ def apply_startup_theme(theme_name):
         print(f"主题加载失败: {e}，回退到默认暗蓝")
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
-
-def load_whitelist():
-    if os.path.exists(WHITELIST_FILE):
-        try:
-            with open(WHITELIST_FILE, 'r') as f: return json.load(f)
-        except: return []
-    return []
-
-def save_whitelist(whitelist):
-    try:
-        with open(WHITELIST_FILE, 'w') as f: json.dump(whitelist, f, indent=2)
-    except: pass
 
 RISK_LEVEL_1 = [
     "\\boot\\", "\\bootmgr", "\\bootnxt", "\\efi\\", "\\windows\\boot\\",
