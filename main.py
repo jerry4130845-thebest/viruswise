@@ -8,6 +8,7 @@ from ctypes import wintypes
 from utils.config import load_config, save_config
 from utils.whitelist import load_whitelist, save_whitelist
 from utils.hash import get_file_hash
+from utils.quarantine import quarantine
 
 CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "crash.log")
 
@@ -173,16 +174,6 @@ def get_risk_level(filepath):
     for risk in RISK_LEVEL_2:
         if risk in filepath_lower: return 2
     return 3
-
-def quarantine(path):
-    try:
-        name = os.path.basename(path)
-        zip_path = os.path.join(QUARANTINE_DIR, name + ".zip")
-        with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.write(path, arcname=name)
-        os.remove(path)
-        return True
-    except: return False
 
 def collect_files(path):
     if os.path.isfile(path): return [path]
