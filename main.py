@@ -13,6 +13,7 @@ from utils.risk import RISK_LEVEL_1, RISK_LEVEL_2, SYSTEM_CRITICAL_PATHS, SYSTEM
 from utils.signature import check_digital_signature
 from utils.network import is_offline
 from utils.fake_log import is_fake_log
+from utils.logging import main_log, scan_log, update_progress
 
 CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "crash.log")
 
@@ -1176,37 +1177,6 @@ def record_processes_for_30_seconds():
         except:
             pass
     threading.Thread(target=record, daemon=True).start()
-
-def main_log(msg):
-    if hasattr(sys, 'app') and sys.app:
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        formatted = f"[{timestamp}] {msg}"
-        try:
-            sys.app.after(0, lambda: sys.app.main_log_box.insert("end", formatted + "\n"))
-        except RuntimeError:
-            pass
-
-def scan_log(msg):
-    if hasattr(sys, 'app') and sys.app:
-        if msg.startswith("=") or msg.startswith("-"):
-            try:
-                sys.app.after(0, lambda: sys.app.scan_log_box.insert("end", msg + "\n"))
-            except RuntimeError:
-                pass
-        else:
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            formatted = f"[{timestamp}] {msg}"
-            try:
-                sys.app.after(0, lambda: sys.app.scan_log_box.insert("end", formatted + "\n"))
-            except RuntimeError:
-                pass
-
-def update_progress(value, text):
-    if hasattr(sys, 'app') and sys.app:
-        try:
-            sys.app.after(0, lambda: sys.app._set_progress(value, text))
-        except RuntimeError:
-            pass
 
 class VirusWiseApp(ctk.CTk):
     def __init__(self):
