@@ -9,6 +9,7 @@ from utils.config import load_config, save_config
 from utils.whitelist import load_whitelist, save_whitelist
 from utils.hash import get_file_hash
 from utils.quarantine import quarantine
+from utils.risk import RISK_LEVEL_1, RISK_LEVEL_2, SYSTEM_CRITICAL_PATHS, SYSTEM_PROCESSES, get_risk_level
 
 CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "crash.log")
 
@@ -141,39 +142,6 @@ def apply_startup_theme(theme_name):
         print(f"主题加载失败: {e}，回退到默认暗蓝")
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
-
-RISK_LEVEL_1 = [
-    "\\boot\\", "\\bootmgr", "\\bootnxt", "\\efi\\", "\\windows\\boot\\",
-    "\\windows\\system32\\config\\", "\\windows\\system32\\drivers\\",
-    "\\windows\\system32\\tasks\\", "\\windows\\system32\\ntoskrnl.exe",
-    "\\windows\\system32\\winload.exe", "\\windows\\system32\\winload.efi",
-    "\\windows\\system32\\hal.dll", "\\windows\\system32\\ntdll.dll",
-    "\\system volume information\\"
-]
-RISK_LEVEL_2 = [
-    "\\programdata\\microsoft\\windows\\start menu\\programs\\startup\\",
-    "\\appdata\\roaming\\microsoft\\windows\\start menu\\programs\\startup\\",
-    "\\windows\\system32\\drivers\\etc\\hosts", "\\windows\\system32\\grouppolicy\\"
-]
-SYSTEM_CRITICAL_PATHS = [
-    "C:\\Windows\\System32", "C:\\Windows\\System32\\drivers",
-    "C:\\Windows\\Boot", "C:\\EFI", "C:\\Boot", "C:\\bootmgr",
-    "C:\\Windows\\System32\\config"
-]
-SYSTEM_PROCESSES = {
-    'system', 'smss.exe', 'csrss.exe', 'wininit.exe', 'services.exe',
-    'lsass.exe', 'svchost.exe', 'winlogon.exe', 'explorer.exe',
-    'taskhost.exe', 'taskhostw.exe', 'dwm.exe', 'conhost.exe'
-}
-
-def get_risk_level(filepath):
-    filepath_lower = filepath.lower()
-    if filepath_lower.endswith('.log'): return 3
-    for risk in RISK_LEVEL_1:
-        if risk in filepath_lower: return 1
-    for risk in RISK_LEVEL_2:
-        if risk in filepath_lower: return 2
-    return 3
 
 def collect_files(path):
     if os.path.isfile(path): return [path]
