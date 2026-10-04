@@ -1,4 +1,5 @@
 import os, subprocess, time, threading
+from utils.config import load_config
 
 class TrustedPublishers:
     STRONG_TRUSTED = {
@@ -245,3 +246,20 @@ class ProcessScoreTracker:
     def remove_process(self, pid):
         with self.score_lock:
             if pid in self.process_scores: del self.process_scores[pid]
+
+class ProcessAnalyzer:
+    def __init__(self):
+        self.profiler = ProcessProfiler()
+        self.config = load_config()
+
+    def calculate_risk(self, monitor):
+        score = 0
+        if self.config['delete_protection'] and hasattr(monitor, 'delete_count'):
+            if monitor.delete_count >= self.config['batch_delete_threshold']: score += 0.6
+        if hasattr(monitor, 'deleted_files'):
+            risk2 = sum(1 for f in monitor.deleted_files if get_risk_level(f) == 2)
+            score += min(0.5, risk2 * 0.1)
+        if hasattr(monitor, 'system_writes'):
+            risk2 = sum(1 for w in monitor.system_writes if get_risk_level(w) == 2)
+            score += min(0.4, risk2 * 0.1)
+        return score
