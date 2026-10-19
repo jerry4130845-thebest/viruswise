@@ -460,43 +460,6 @@ def show_whitelist(self):
     self.refresh_whitelist_display()
     self._show_page("whitelist")
 
-def _build_scan_page(self):
-    frame = ctk.CTkFrame(self.content_frame)
-    ctk.CTkLabel(frame, text="病毒查杀", font=("Arial", 16, "bold")).pack(anchor="w", padx=10, pady=5)
-
-    mode_frame = ctk.CTkFrame(frame)
-    mode_frame.pack(fill="x", padx=10, pady=5)
-    self.scan_mode = ctk.CTkComboBox(mode_frame, values=["单文件查杀", "文件夹查杀", "全盘查杀 (Defender)"])
-    self.scan_mode.pack(side="left", padx=5)
-    self.scan_mode.set("单文件查杀")
-    self.sig_var = ctk.CTkCheckBox(mode_frame, text="数字签名验证")
-    self.sig_var.pack(side="left", padx=10)
-
-    prog_frame = ctk.CTkFrame(frame)
-    prog_frame.pack(fill="x", padx=10, pady=5)
-    self.prog_label = ctk.CTkLabel(prog_frame, text="准备就绪")
-    self.prog_label.pack(side="left", padx=5)
-    self.prog_bar = ctk.CTkProgressBar(prog_frame, width=300)
-    self.prog_bar.pack(side="left", padx=10)
-    self.prog_bar.set(0)
-
-    self.scan_log_box = ctk.CTkTextbox(frame, height=100)
-    self.scan_log_box.pack(fill="x", padx=10, pady=5)
-
-    self.file_scroll_frame = ctk.CTkScrollableFrame(frame, height=200)
-    self.file_scroll_frame.pack(expand=True, fill="both", padx=10, pady=5)
-
-    btn_frame = ctk.CTkFrame(frame)
-    btn_frame.pack(fill="x", padx=10, pady=5)
-    self.exec_btn = ctk.CTkButton(btn_frame, text="执行扫描", command=self.start_scan_thread)
-    self.exec_btn.pack(side="left", padx=5)
-    self.sel_btn = ctk.CTkButton(btn_frame, text="全选/取消", width=100, command=self.toggle_all)
-    self.sel_btn.pack(side="left", padx=5)
-    self.proc_btn = ctk.CTkButton(btn_frame, text="一键处理", width=100, command=self.process_selected)
-    self.proc_btn.pack(side="left", padx=5)
-    self.proc_btn.configure(state="disabled")
-    return frame
-
 def _build_settings_page(self):
     frame = ctk.CTkScrollableFrame(self.content_frame)
 
