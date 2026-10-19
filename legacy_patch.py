@@ -505,26 +505,6 @@ def _set_progress(self, value, text):
     self.prog_bar.set(value / 100.0)
     self.prog_label.configure(text=text)
 
-def save_config_key(self, key, val):
-    self.config[key] = val
-    save_config(self.config)
-
-def save_api_key(self):
-    self.config['apikey'] = self.api_key_var.get().strip()
-    save_config(self.config)
-    global API_KEY; API_KEY = self.config['apikey']
-    main_log("API Key已保存")
-    messagebox.showinfo("成功", "API Key已保存")
-
-def toggle_api_visibility(self):
-    current_show = self.api_key_var.cget("show")
-    if current_show == "*":
-        self.api_key_var.configure(show="")
-        self.api_show_hide_btn.configure(text="隐藏")
-    else:
-        self.api_key_var.configure(show="*")
-        self.api_show_hide_btn.configure(text="显示")
-
 def _init_defender_check(self):
     def init_check():
         try:
@@ -551,82 +531,6 @@ def check_defender(self):
         except RuntimeError:
             pass
     threading.Thread(target=check, daemon=True).start()
-
-def save_engine(self):
-    self.config['virustotal'] = self.vt_var.get()
-    self.config['windows_defender'] = self.wd_var.get()
-    self.config['windows_defender_offline_only'] = self.wd_offline_var.get()
-    self.config['windows_defender_force'] = self.wd_force_var.get()
-    save_config(self.config)
-    main_log("引擎设置已保存")
-    messagebox.showinfo("成功", "引擎设置已保存")
-
-def add_dir(self):
-    d = filedialog.askdirectory()
-    if d:
-        d = os.path.normpath(d)
-        if not any(d == self.dir_listbox.get(i) for i in range(self.dir_listbox.size())):
-            self.dir_listbox.insert("end", d)
-
-def remove_dir(self):
-    sel = self.dir_listbox.curselection()
-    if sel: self.dir_listbox.delete(sel[0])
-
-def save_ad(self):
-    if self.ad_restarting:
-        messagebox.showinfo("提示", "主动防御正在重启中，请稍后...")
-        return
-    self.config['ad_enabled'] = self.ad_enabled_var.get()
-    self.config['delete_protection'] = self.delete_var.get()
-    try: self.config['batch_delete_threshold'] = int(self.threshold_var.get())
-    except: pass
-    self.config['modify_protection'] = self.modify_var.get()
-    self.config['monitor_dirs'] = [self.dir_listbox.get(i) for i in range(self.dir_listbox.size())]
-    self.config['wl_by_name'] = self.wl_name_var.get()
-    self.config['wl_by_hash'] = self.wl_hash_var.get()
-    if self.config['ad_enabled'] and not self.config.get('ad_warned_on_enable', False):
-        self.config['ad_warned_on_enable'] = True
-        save_config(self.config)
-        messagebox.showinfo("提示", "最好先进行白名单记录，否则会出现奇奇怪怪的误报")
-    else:
-        save_config(self.config)
-        messagebox.showinfo("成功", "主动防御设置已保存")
-
-    global ACTIVE_DEFENSE_ENABLED, MONITOR_DIRS
-    ACTIVE_DEFENSE_ENABLED = self.config['ad_enabled']
-    MONITOR_DIRS = self.config['monitor_dirs'].copy()
-
-    old_ad = self.ad
-    self.ad = None
-    self.ad_restarting = True
-
-    def restart():
-        if old_ad and old_ad.running: old_ad.stop()
-        try:
-            self.after(0, self._start_new_ad)
-        except RuntimeError:
-            pass
-    threading.Thread(target=restart, daemon=True).start()
-
-def _start_new_ad(self):
-    try:
-        if ACTIVE_DEFENSE_ENABLED and WATCHDOG_AVAILABLE:
-            self.ad = ActiveDefense(); self.ad.start(MONITOR_DIRS)
-            main_log("主动防御已更新并启动")
-        else:
-            self.ad = None; main_log("主动防御已停止")
-        if self.ad: self.ad.refresh_whitelist()
-    except Exception as e:
-        main_log(f"主动防御启动失败: {e}")
-        self.ad = None
-    self.ad_restarting = False
-    messagebox.showinfo("成功", "主动防御设置已保存")
-
-def save_theme(self):
-    selected = self.theme_var.get()
-    self.config['theme'] = selected
-    save_config(self.config)
-    messagebox.showinfo("主题已保存", f"主题“{selected}”将在下次启动程序时生效。")
 
 def _clear_scan_results(self):
     for widget in self.file_scroll_frame.winfo_children(): widget.destroy()
