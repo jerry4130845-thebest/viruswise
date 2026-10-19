@@ -1,11 +1,13 @@
 import os, sys, time, threading, queue, hashlib, random, ctypes, subprocess, zipfile
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 import tkinter as tk
 from tkinter import messagebox, filedialog, ttk
 from types import SimpleNamespace
 import customtkinter as ctk
 import psutil
 import requests
-
 from utils.paths import BASE_DIR, DATA_DIR, QUARANTINE_DIR, WHITELIST_FILE, THEME_WARM_YELLOW
 from utils.config import load_config, save_config
 from utils.whitelist import load_whitelist, save_whitelist
