@@ -770,58 +770,6 @@ def full_scan(self):
     scan_log(f"发现 {len(self.danger_files)} 个威胁")
     self.after(0, self.refresh_list)
 
-def refresh_suspended_table(self):
-    for row in self.susp_tree.get_children(): self.susp_tree.delete(row)
-    with suspended_lock:
-        to_remove = [pid for pid in SUSPENDED_PROCS if not psutil.pid_exists(pid)]
-        for pid in to_remove: del SUSPENDED_PROCS[pid]
-    for pid, p in SUSPENDED_PROCS.items():
-        self.susp_tree.insert("", "end", values=(p['name'], pid, p['reason'], p['exe']))
-
-def get_selected_suspended(self):
-    sel = self.susp_tree.selection()
-    if not sel: messagebox.showwarning("提示","请先选择进程"); return []
-    result = []
-    for item in sel:
-        vals = self.susp_tree.item(item, 'values')
-        result.append({'pid':int(vals[1]), 'exe':vals[3], 'name':vals[0]})
-    return result
-
-def suspended_resume(self):
-    for p in self.get_selected_suspended():
-        try: psutil.Process(p['pid']).resume()
-        except: pass
-        with suspended_lock:
-            if p['pid'] in SUSPENDED_PROCS: del SUSPENDED_PROCS[p['pid']]
-    self.refresh_suspended_table()
-
-def suspended_add_white(self):
-    for p in self.get_selected_suspended():
-        wl = load_whitelist()
-        h = None
-        if p['exe'] and os.path.exists(p['exe']):
-            with open(p['exe'],'rb') as f: h = hashlib.sha256(f.read()).hexdigest()
-        wl.append({'name':p['name'], 'pid':p['pid'], 'path':p['exe'], 'hash':h, 'time':time.time()})
-        save_whitelist(wl)
-        try: psutil.Process(p['pid']).resume()
-        except: pass
-        with suspended_lock:
-            if p['pid'] in SUSPENDED_PROCS: del SUSPENDED_PROCS[p['pid']]
-    self.refresh_suspended_table()
-
-def suspended_kill(self):
-    for p in self.get_selected_suspended():
-        try: proc = psutil.Process(p['pid']); proc.terminate(); proc.wait(timeout=5)
-        except: pass
-        with suspended_lock:
-            if p['pid'] in SUSPENDED_PROCS: del SUSPENDED_PROCS[p['pid']]
-    self.refresh_suspended_table()
-
-def suspended_open_loc(self):
-    for p in self.get_selected_suspended():
-        if p['exe'] and os.path.exists(p['exe']):
-            os.startfile(os.path.dirname(p['exe']))
-
 def refresh_whitelist_display(self, filter_text=""):
     self.wl_listbox.delete(0, "end")
     whitelist = load_whitelist()
