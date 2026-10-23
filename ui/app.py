@@ -24,6 +24,8 @@ from core.scoring import ProcessAnalyzer, ProcessScoreTracker
 from core.active_defense import ActiveDefense
 from ui.theme import THEME_PRESETS, apply_startup_theme
 from core.active_defense import TEMPORARY_ALLOWED, SUSPENDED_PROCS, suspended_lock, alerted_processes, alert_lock
+from core.active_defense import ad_queue
+
 
 BASE_URL = "https://www.virustotal.com/api/v3"
 MAX_UPLOAD_SIZE = 30 * 1024 * 1024
@@ -744,3 +746,53 @@ class VirusWiseApp(ctk.CTk):
             self._rick_popups.clear()
         except Exception as e:
             main_log(f"清理rickroll弹窗失败: {e}")
+
+    def _start_timers(self):
+        self._check_ad_queue()
+        self._start_suspended_refresh()
+
+    def _check_ad_queue(self):
+        while not ad_queue.empty():
+            try:
+                msg = ad_queue.get_nowait()
+                if msg[0] == 'alert': self.show_suspicious_alert(msg[1])
+                elif msg[0] == 'scoring_alert': self.show_scoring_alert(msg[1])
+                elif msg[0] == 'viral_alert': self.show_viral_alert(msg[1])
+                elif msg[0] == 'protection_alert': self.show_protection_alert(msg[1])
+            except queue.Empty: break
+        self.ad_check_timer = self.after(100, self._check_ad_queue)
+
+    def _start_suspended_refresh(self):
+        self.refresh_suspended_table()
+        self.suspended_timer_id = self.after(5000, self._start_suspended_refresh)
+
+    def _set_progress(self, value, text):
+        self.prog_bar.set(value / 100.0)
+        self.prog_label.configure(text=text)
+
+    def _init_defender_check(self):
+        def init_check():
+            try:
+                offline_only = self.config.get('windows_defender_offline_only', True)
+                self.defender = DefenderScanner(offline_only=offline_only)
+                if self.defender.available:
+                    main_log("✅ Windows Defender已初始化并可用")
+                else:
+                    main_log("⚠️ Windows Defender不可用或未启用")
+            except Exception as e:
+                main_log(f"初始化Defender检测失败: {e}")
+        threading.Thread(target=init_check, daemon=True).start()
+
+    def check_defender(self):
+        def check():
+            try:
+                r = subprocess.run(['powershell', 'Get-MpComputerStatus | Select AntivirusEnabled'],
+                                capture_output=True, text=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW)
+                status = "✔️可用" if "True" in r.stdout else "❌不可用"
+            except: 
+                status = "❌不可用"
+            try:
+                self.after(0, lambda: self.wd_status.configure(text=status))
+            except RuntimeError:
+                pass
+        threading.Thread(target=check, daemon=True).start()
