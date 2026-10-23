@@ -23,6 +23,7 @@ from core.defender import DefenderScanner
 from core.scoring import ProcessAnalyzer, ProcessScoreTracker
 from core.active_defense import ActiveDefense
 from ui.theme import THEME_PRESETS, apply_startup_theme
+from core.active_defense import TEMPORARY_ALLOWED, SUSPENDED_PROCS, suspended_lock, alerted_processes, alert_lock
 
 BASE_URL = "https://www.virustotal.com/api/v3"
 MAX_UPLOAD_SIZE = 30 * 1024 * 1024
@@ -434,3 +435,125 @@ class VirusWiseApp(ctk.CTk):
         save_config(self.config)
         messagebox.showinfo("主题已保存", f"主题“{selected}”将在下次启动程序时生效。")
 
+    def _alert_popup(self, title, info, score_bar=False, color="#ff6600", critical=False, suspicious=False, protection=False):
+        key = f"{info.get('pid','')}_{info.get('name','')}_{title}"
+        now = time.time()
+        if key in self.alert_cooldown and now - self.alert_cooldown[key] < 5: return
+        self.alert_cooldown[key] = now
+
+        top = ctk.CTkToplevel(self)
+        top.title(title)
+        top.geometry("700x600")
+        top.attributes("-topmost", True)
+        top.grab_set()
+
+        frame = ctk.CTkFrame(top)
+        frame.pack(expand=True, fill="both", padx=10, pady=10)
+
+        if critical: ctk.CTkLabel(frame, text="发现恶意软件 - 已自动隔离", font=("Arial",16,"bold"), text_color="red").pack()
+        else: ctk.CTkLabel(frame, text=title, font=("Arial",14,"bold"), text_color=color).pack()
+
+        if score_bar and 'score' in info:
+            pbar = ctk.CTkProgressBar(frame, width=300)
+            pbar.set(info['score'] / 120); pbar.pack(pady=5)
+            ctk.CTkLabel(frame, text=f"威胁评分: {info['score']:.0f} / 120").pack()
+
+        details = f"进程: {info.get('name','')}  PID: {info.get('pid','')}\n路径: {info.get('exe','')}"
+        ctk.CTkLabel(frame, text=details, justify="left").pack(anchor="w", pady=5)
+
+        if info.get('rules'):
+            ctk.CTkLabel(frame, text="触发规则:", font=("Arial",11,"bold")).pack(anchor="w")
+            rules_box = ctk.CTkTextbox(frame, height=100)
+            rules_box.insert("1.0", '\n'.join(info['rules']))
+            rules_box.configure(state="disabled")
+            rules_box.pack(fill="x", padx=5)
+
+        btn_frame = ctk.CTkFrame(frame)
+        btn_frame.pack(pady=10)
+        ctk.CTkButton(btn_frame, text="加入白名单", command=lambda: self.alert_add_white(info, top)).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="终止进程", fg_color="red", command=lambda: self.alert_term(info, top)).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="隔离病毒", fg_color="purple", command=lambda: self.alert_quarantine(info, top)).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="允许本次操作", command=lambda: self.allow_this_operation(info, top)).pack(side="left", padx=5)
+
+    def show_scoring_alert(self, info): self._alert_popup("主动防御告警 - 可疑进程", info, score_bar=True, color="#ff6600")
+    def show_viral_alert(self, info): self._alert_popup("主动防御 - 发现恶意软件", info, critical=True)
+    def show_suspicious_alert(self, info): self._alert_popup("主动防御告警 - 发现可疑操作", info, suspicious=True)
+    def show_protection_alert(self, info): self._alert_popup("主动防御 - 文件保护触发", info, protection=True)
+
+    def allow_this_operation(self, info, top):
+        pid = info['pid']
+        try: psutil.Process(pid).resume()
+        except: pass
+        with suspended_lock:
+            if pid in SUSPENDED_PROCS: del SUSPENDED_PROCS[pid]
+        with alert_lock: alerted_processes.discard(pid)
+        TEMPORARY_ALLOWED.add(pid)
+        top.destroy()
+
+    def alert_add_white(self, info, top):
+        wl = load_whitelist()
+        h = None
+        if info['exe'] and os.path.exists(info['exe']):
+            with open(info['exe'],'rb') as f: h = hashlib.sha256(f.read()).hexdigest()
+        wl.append({'name':info['name'], 'pid':info['pid'], 'path':info['exe'], 'hash':h, 'time':time.time()})
+        save_whitelist(wl)
+        try: psutil.Process(info['pid']).resume()
+        except: pass
+        with suspended_lock:
+            if info['pid'] in SUSPENDED_PROCS: del SUSPENDED_PROCS[info['pid']]
+        with alert_lock: alerted_processes.discard(info['pid'])
+        if self.ad: self.ad.refresh_whitelist()
+        top.destroy()
+
+    def alert_term(self, info, top):
+        pid = info['pid']
+        try: proc = psutil.Process(pid); proc.terminate(); proc.wait(timeout=5)
+        except: pass
+        with suspended_lock:
+            if pid in SUSPENDED_PROCS: del SUSPENDED_PROCS[pid]
+        with alert_lock: alerted_processes.discard(pid)
+        top.destroy()
+
+    def alert_quarantine(self, info, top):
+        pid = info['pid']
+        try: proc = psutil.Process(pid); proc.terminate(); proc.wait(timeout=5)
+        except: pass
+        with suspended_lock:
+            if pid in SUSPENDED_PROCS: del SUSPENDED_PROCS[pid]
+        with alert_lock: alerted_processes.discard(pid)
+        if quarantine(info['exe']): messagebox.showinfo("成功", "已隔离病毒")
+        else: messagebox.showerror("失败", "隔离失败")
+        top.destroy()
+
+    def alert_online(self, info):
+        if not self.config.get('virustotal'): messagebox.showinfo("提示","VirusTotal已禁用"); return
+        h = None
+        if info.get('exe') and os.path.exists(info['exe']):
+            try:
+                with open(info['exe'],'rb') as f: h = hashlib.sha256(f.read()).hexdigest()
+            except: pass
+        if not h: messagebox.showerror("错误","无法计算哈希"); return
+        api_key = self.config.get('apikey','').strip()
+        if not api_key: messagebox.showerror("错误","请先设置API Key"); return
+        def analyze():
+            try:
+                r = requests.get(f"{BASE_URL}/files/{h}", headers={"x-apikey":api_key}, timeout=15)
+                if r.status_code == 200:
+                    data = r.json()
+                    stats = data.get("data",{}).get("attributes",{}).get("last_analysis_stats",{})
+                    msg = f"恶意: {stats.get('malicious',0)}\n可疑: {stats.get('suspicious',0)}"
+                    try:
+                        self.after(0, lambda: messagebox.showinfo("在线分析结果", msg))
+                    except RuntimeError:
+                        pass
+                else: 
+                    try:
+                        self.after(0, lambda: messagebox.showwarning("提示","文件尚未被分析"))
+                    except RuntimeError:
+                        pass
+            except Exception as e: 
+                try:
+                    self.after(0, lambda: messagebox.showerror("错误",str(e)))
+                except RuntimeError:
+                    pass
+        threading.Thread(target=analyze, daemon=True).start()
