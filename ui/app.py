@@ -25,11 +25,68 @@ from core.active_defense import ActiveDefense
 from ui.theme import THEME_PRESETS, apply_startup_theme
 from core.active_defense import TEMPORARY_ALLOWED, SUSPENDED_PROCS, suspended_lock, alerted_processes, alert_lock
 from core.active_defense import ad_queue
+import core.active_defense as admod
 
 
 BASE_URL = "https://www.virustotal.com/api/v3"
 MAX_UPLOAD_SIZE = 30 * 1024 * 1024
 API_KEY = ""
+
+
+def record_processes_for_30_seconds():
+    ad_was_running = False
+    app = getattr(sys, 'app', None)
+    if app and app.ad and app.ad.running:
+        ad_was_running = True
+        app.ad.stop()
+    main_log("主动防御已暂停，开始记录白名单...")
+    popup = ctk.CTkToplevel(app)
+    popup.title("白名单记录中")
+    popup.geometry("300x150")
+    popup.attributes("-topmost", True)
+    ctk.CTkLabel(popup, text="正在记录进程到白名单\n持续时间: 30秒\n主动防御已暂停", font=("Arial", 12)).pack(pady=20)
+    popup.update()
+
+    def record():
+        whitelist = load_whitelist()
+        existing = {item.get('hash') for item in whitelist if item.get('hash')}
+        count = 0
+        recorded = set()
+        for _ in range(30):
+            try:
+                for proc in psutil.process_iter(['pid', 'name', 'exe']):
+                    try:
+                        pid = proc.info['pid']
+                        if pid in recorded: continue
+                        name, exe = proc.info['name'], proc.info['exe']
+                        if name.lower() in SYSTEM_PROCESSES: recorded.add(pid); continue
+                        if exe and os.path.exists(exe):
+                            try:
+                                with open(exe, 'rb') as f: h = hashlib.sha256(f.read()).hexdigest()
+                                if h not in existing:
+                                    whitelist.append({'name': name, 'pid': pid, 'path': exe, 'hash': h, 'time': time.time()})
+                                    existing.add(h); recorded.add(pid); count += 1
+                            except: pass
+                    except: pass
+            except: pass
+            time.sleep(1)
+        save_whitelist(whitelist)
+        if ad_was_running and admod.ACTIVE_DEFENSE_ENABLED and admod.WATCHDOG_AVAILABLE and getattr(sys, 'app', None):
+            try:
+                sys.app.ad = admod.ActiveDefense()
+                sys.app.ad.start(admod.MONITOR_DIRS)
+                main_log(f"30秒记录完成，共添加 {count} 个新进程到白名单，主动防御已恢复")
+            except Exception as e:
+                main_log(f"主动防御恢复失败: {e}")
+        else:
+            main_log(f"30秒记录完成，共添加 {count} 个新进程到白名单")
+        try:
+            popup.after(0, popup.destroy)
+        except RuntimeError:
+            pass
+        except:
+            pass
+    threading.Thread(target=record, daemon=True).start()
 
 class VirusWiseApp(ctk.CTk):
     def __init__(self):
@@ -40,7 +97,7 @@ class VirusWiseApp(ctk.CTk):
         self.minsize(900, 650)
 
         self.config = load_config()
-        global API_KEY, ACTIVE_DEFENSE_ENABLED, MONITOR_DIRS
+        global API_KEY
         API_KEY = self.config.get('apikey', '').strip()
 
         theme = self.config.get('theme', 'default')
@@ -55,17 +112,17 @@ class VirusWiseApp(ctk.CTk):
         self._rick_cleanup_done = False
         self._rick_popups = []
         self.defender = None
-        ACTIVE_DEFENSE_ENABLED = self.config['ad_enabled']
-        MONITOR_DIRS = self.config['monitor_dirs'].copy()
+        admod.ACTIVE_DEFENSE_ENABLED = self.config['ad_enabled']
+        admod.MONITOR_DIRS = self.config['monitor_dirs'].copy()
 
         self._build_ui()
         self._init_defender_check()
         self._start_timers()
 
-        watchdog_available = getattr(sys.modules.get('legacy_patch'), 'WATCHDOG_AVAILABLE', False)
-        if ACTIVE_DEFENSE_ENABLED and watchdog_available:
+        watchdog_available = admod.WATCHDOG_AVAILABLE
+        if admod.ACTIVE_DEFENSE_ENABLED and watchdog_available:
             self.after(1000, self._delayed_start_active_defense)
-        elif ACTIVE_DEFENSE_ENABLED and not watchdog_available:
+        elif admod.ACTIVE_DEFENSE_ENABLED and not watchdog_available:
             main_log("警告: watchdog模块未安装，主动防御已禁用")
             messagebox.showwarning("警告", "watchdog模块未安装，主动防御功能不可用。")
 
@@ -275,7 +332,6 @@ class VirusWiseApp(ctk.CTk):
         return frame
 
     def record_processes_for_30_seconds(self):
-        from legacy_patch import record_processes_for_30_seconds
         record_processes_for_30_seconds()
 
     def _build_tools_page(self):
@@ -401,9 +457,8 @@ class VirusWiseApp(ctk.CTk):
             save_config(self.config)
             messagebox.showinfo("成功", "主动防御设置已保存")
 
-        global ACTIVE_DEFENSE_ENABLED, MONITOR_DIRS
-        ACTIVE_DEFENSE_ENABLED = self.config['ad_enabled']
-        MONITOR_DIRS = self.config['monitor_dirs'].copy()
+        admod.ACTIVE_DEFENSE_ENABLED = self.config['ad_enabled']
+        admod.MONITOR_DIRS = self.config['monitor_dirs'].copy()
 
         old_ad = self.ad
         self.ad = None
@@ -419,8 +474,8 @@ class VirusWiseApp(ctk.CTk):
 
     def _start_new_ad(self):
         try:
-            if ACTIVE_DEFENSE_ENABLED and WATCHDOG_AVAILABLE:
-                self.ad = ActiveDefense(); self.ad.start(MONITOR_DIRS)
+            if admod.ACTIVE_DEFENSE_ENABLED and admod.WATCHDOG_AVAILABLE:
+                self.ad = ActiveDefense(); self.ad.start(admod.MONITOR_DIRS)
                 main_log("主动防御已更新并启动")
             else:
                 self.ad = None; main_log("主动防御已停止")
@@ -796,3 +851,279 @@ class VirusWiseApp(ctk.CTk):
             except RuntimeError:
                 pass
         threading.Thread(target=check, daemon=True).start()
+
+    def _delayed_start_active_defense(self):
+        """延迟启动主动防御，避免阻塞UI初始化"""
+        try:
+            if not self.ad or not self.ad.running:
+                whitelist = load_whitelist()
+                if not whitelist:
+                    # 改为后台提示，不阻塞
+                    def check_whitelist():
+                        if messagebox.askyesno("白名单记录", "白名单为空，是否开始30秒进程记录？"):
+                            record_processes_for_30_seconds()
+                        else:
+                            main_log("跳过白名单记录")
+                    threading.Thread(target=check_whitelist, daemon=True).start()
+                else:
+                    self.ad = ActiveDefense()
+                    self.ad.start(admod.MONITOR_DIRS)
+            else:
+                self.ad = ActiveDefense()
+                self.ad.start(admod.MONITOR_DIRS)
+        except Exception as e:
+            main_log(f"延迟启动主动防御失败: {e}")
+
+    def _clear_scan_results(self):
+        for widget in self.file_scroll_frame.winfo_children(): widget.destroy()
+        self.file_checkbuttons.clear()
+        self.danger_files.clear()
+        self.proc_btn.configure(state="disabled")
+        self.scan_log_box.delete("1.0", "end")
+        self._set_progress(0, "准备就绪")
+
+    def prepare_scan_ui(self):
+        self.after(0, self._clear_scan_results)
+
+    def toggle_all(self):
+        if not self.danger_files: return
+        new_state = not all(cb.get() for cb in self.file_checkbuttons)
+        for cb in self.file_checkbuttons:
+            if new_state: cb.select()
+            else: cb.deselect()
+        self.update_btn_text()
+
+    def update_btn_text(self):
+        self.proc_btn.configure(state="normal" if self.danger_files else "disabled")
+
+    def process_selected(self):
+        count = 0; remaining = []
+        for i, cb in enumerate(self.file_checkbuttons):
+            if cb.get():
+                if quarantine(self.danger_files[i]['path']): count += 1
+                else: remaining.append(self.danger_files[i])
+        self.danger_files = remaining
+        self.refresh_list()
+        if count: scan_log(f"已隔离 {count} 个文件")
+
+    def refresh_list(self):
+        for widget in self.file_scroll_frame.winfo_children(): widget.destroy()
+        self.file_checkbuttons.clear()
+        self._remaining_to_add = list(enumerate(self.danger_files))
+        self.after(10, self._add_batch)
+
+    def _add_batch(self):
+        batch_size = 20
+        for _ in range(batch_size):
+            if not self._remaining_to_add:
+                self.update_btn_text()
+                threading.Thread(target=self._update_signatures, daemon=True).start()
+                return
+            i, f = self._remaining_to_add.pop(0)
+            cb = ctk.CTkCheckBox(self.file_scroll_frame, text=f"扫描 {os.path.basename(f['path'])} ...")
+            cb.pack(anchor="w", padx=5)
+            cb.select()
+            cb.configure(command=self.update_btn_text)
+            self.file_checkbuttons.append(cb)
+        if self._remaining_to_add:
+            self.after(10, self._add_batch)
+        else:
+            self.update_btn_text()
+            threading.Thread(target=self._update_signatures, daemon=True).start()
+
+    def _update_signatures(self):
+        updates = []
+        for i, f in enumerate(self.danger_files):
+            sig = ""
+            if self.sig_var.get():
+                if not check_digital_signature(f['path']): sig = "无签名，"
+            text = f"{os.path.basename(f['path'])} {sig}{f.get('type','')} 恶意({f.get('malicious',0)})"
+            updates.append((i, text))
+        def apply():
+            for idx, text in updates:
+                if idx < len(self.file_checkbuttons): self.file_checkbuttons[idx].configure(text=text)
+        try:
+            self.after(0, apply)
+        except RuntimeError:
+            pass
+
+    def start_scan_thread(self):
+        if self.scanning:
+            messagebox.showinfo("提示", "已有扫描任务正在运行"); return
+        self.scanning = True; self.exec_btn.configure(state="disabled")
+        mode = self.scan_mode.get()
+        if mode == "单文件查杀":
+            if not self.config['virustotal']:
+                messagebox.showinfo("提示", "请开启virustotal云查杀引擎"); self.scanning = False; self.exec_btn.configure(state="normal"); return
+            target = filedialog.askopenfilename()
+            if not target: self.scanning = False; self.exec_btn.configure(state="normal"); return
+            self.prepare_scan_ui()
+            threading.Thread(target=lambda: self._safe_scan(self.single_file_scan, target), daemon=True).start()
+        elif mode == "文件夹查杀":
+            if not self.config['virustotal']:
+                messagebox.showinfo("提示", "请开启virustotal云查杀引擎"); self.scanning = False; self.exec_btn.configure(state="normal"); return
+            target = filedialog.askdirectory()
+            if not target: self.scanning = False; self.exec_btn.configure(state="normal"); return
+            self.prepare_scan_ui()
+            threading.Thread(target=lambda: self._safe_scan(self.folder_scan, target), daemon=True).start()
+        else:
+            self.prepare_scan_ui()
+            threading.Thread(target=lambda: self._safe_scan(self.full_scan), daemon=True).start()
+
+    def _safe_scan(self, scan_func, *args):
+        try: scan_func(*args)
+        except Exception as e: scan_log(f"扫描过程发生错误: {e}")
+        finally:
+            self.scanning = False
+            try:
+                self.after(0, lambda: self.exec_btn.configure(state="normal"))
+            except RuntimeError:
+                pass
+
+    def single_file_scan(self, target):
+        api_key = self.config.get('apikey','').strip()
+        if not api_key:
+            scan_log("API Key为空")
+            update_progress(0, "扫描已终止")
+            return
+        global API_KEY
+        API_KEY = api_key
+        self.danger_files = []
+        update_progress(0, "准备扫描...")
+        scan_log("="*50)
+        scan_log(f"开始单文件扫描: {target}")
+        if not os.path.exists(target):
+            scan_log("文件不存在")
+            update_progress(0, "扫描已终止")
+            return
+
+        size = os.path.getsize(target)
+        update_progress(10, "计算哈希...")
+        whitelist = load_whitelist()
+        whitelist_hashes = {item['hash'] for item in whitelist if item.get('hash')}
+        h = get_file_hash(target)
+        if not h:
+            scan_log("无法计算哈希")
+            update_progress(0, "扫描已终止")
+            return
+        if h in whitelist_hashes:
+            scan_log("文件在白名单中")
+            update_progress(100, "扫描完成")
+            return
+
+        update_progress(30, "查询VT...")
+        url = f"{BASE_URL}/files/{h}"
+        headers = {"x-apikey": api_key}
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            if r.status_code == 404:
+                scan_log("文件未被收录")
+                if size > MAX_UPLOAD_SIZE:
+                    scan_log(f"文件超过30MB ({size//(1024*1024)}MB)，仅使用SHA256查询VT，不上传文件")
+                    update_progress(100, "扫描完成")
+                    return
+                scan_log("正在上传到 VT 分析...")
+                update_progress(50, "上传文件中...")
+                upload_url = "https://www.virustotal.com/api/v3/files"
+                with open(target, 'rb') as f:
+                    files = {'file': (os.path.basename(target), f)}
+                    upload_r = requests.post(upload_url, headers={"x-apikey": api_key}, files=files, timeout=60)
+                if upload_r.status_code == 200:
+                    upload_data = upload_r.json()
+                    analysis_id = upload_data.get('data', {}).get('id', '')
+                    scan_log(f"文件已上传，分析ID: {analysis_id}")
+                    scan_log("等待分析完成...")
+                    update_progress(70, "等待VT分析...")
+                    analysis_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
+                    for _ in range(20):
+                        time.sleep(5)
+                        analysis_r = requests.get(analysis_url, headers={"x-apikey": api_key}, timeout=30)
+                        if analysis_r.status_code == 200:
+                            analysis_data = analysis_r.json()
+                            status = analysis_data.get('data', {}).get('attributes', {}).get('status', '')
+                            if status == 'completed':
+                                stats = analysis_data.get('data', {}).get('attributes', {}).get('stats', {})
+                                malicious = stats.get('malicious', 0)
+                                suspicious = stats.get('suspicious', 0)
+                                if self.config.get('sensitive'):
+                                    if malicious >= 1:
+                                        self.danger_files.append({'path':target, 'type':"恶意(上传分析)", 'malicious':malicious, 'suspicious':suspicious, 'mode':'single'})
+                                else:
+                                    if malicious >= 6:
+                                        self.danger_files.append({'path':target, 'type':"恶意(上传分析)", 'malicious':malicious, 'suspicious':suspicious, 'mode':'single'})
+                                scan_log(f"分析完成 - 恶意:{malicious}, 可疑:{suspicious}")
+                                break
+                        time.sleep(5)
+                else:
+                    scan_log(f"上传失败 HTTP {upload_r.status_code}")
+                update_progress(100, "扫描完成")
+                return
+            if r.status_code != 200:
+                scan_log(f"VT异常 HTTP {r.status_code}")
+                update_progress(100, "扫描完成")
+                return
+            data = r.json()
+            stats = data.get("data",{}).get("attributes",{}).get("last_analysis_stats",{})
+            malicious = stats.get("malicious",0)
+            suspicious = stats.get("suspicious",0)
+            if self.config.get('sensitive'):
+                if malicious >= 1:
+                    self.danger_files.append({'path':target, 'type':"恶意", 'malicious':malicious, 'suspicious':suspicious, 'mode':'single'})
+            else:
+                if malicious >= 6:
+                    self.danger_files.append({'path':target, 'type':"恶意", 'malicious':malicious, 'suspicious':suspicious, 'mode':'single'})
+        except Exception as e:
+            scan_log(f"请求失败: {e}")
+        update_progress(100, "扫描完成")
+        scan_log(f"发现 {len(self.danger_files)} 个危险项")
+        self.after(0, self.refresh_list)
+
+    def full_scan(self):
+        self.danger_files = []
+        scan_log("="*50)
+        scan_log("全盘查杀 (Windows Defender)")
+        update_progress(0, "初始化...")
+
+        defender = DefenderScanner(
+            offline_only=self.config.get('windows_defender_offline_only', True),
+            force_use=self.config.get('windows_defender_force', False)
+        )
+
+        if not defender.available:
+            scan_log("Defender 不可用")
+            self.after(0, lambda: messagebox.showerror("错误", "Defender 不可用"))
+            return
+
+        update_progress(10, "全盘扫描中，请耐心等待...")
+        scan_log("全盘扫描中，这可能需要较长时间...")
+
+        threats = defender.full_scan()
+
+        self.danger_files = [
+            {
+                'path': t.get('path', '未知'),
+                'type': f"Defender: {t.get('name', '未知威胁')}",
+                'malicious': 'Defender'
+            }
+            for t in threats
+        ]
+
+        update_progress(100, "扫描完成")
+        scan_log(f"发现 {len(self.danger_files)} 个威胁")
+        self.after(0, self.refresh_list)
+
+    def destroy(self):
+        try:
+            self._cleanup_all_rick_popups()
+        except: pass
+        try:
+            if self.ad_check_timer: self.after_cancel(self.ad_check_timer)
+        except: pass
+        try:
+            if self.suspended_timer_id: self.after_cancel(self.suspended_timer_id)
+        except: pass
+        try:
+            if self.ad and self.ad.running:
+                threading.Thread(target=self.ad.stop, daemon=True).start()
+        except: pass
+        super().destroy()
