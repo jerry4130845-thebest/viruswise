@@ -770,27 +770,6 @@ def full_scan(self):
     scan_log(f"发现 {len(self.danger_files)} 个威胁")
     self.after(0, self.refresh_list)
 
-def refresh_whitelist_display(self, filter_text=""):
-    self.wl_listbox.delete(0, "end")
-    whitelist = load_whitelist()
-    for item in whitelist:
-        name = item.get('name') or '未知'
-        path = item.get('path') or '未知'
-        if not filter_text or filter_text.lower() in name.lower() or filter_text.lower() in path.lower():
-            self.wl_listbox.insert("end", f"{name} - {path}")
-
-def remove_whitelist_item(self):
-    sel = self.wl_listbox.curselection()
-    if not sel: return
-    idx = sel[0]
-    text = self.wl_listbox.get(idx)
-    name, _, path = text.partition(" - ")
-    wl = load_whitelist()
-    new_wl = [w for w in wl if not (w.get('name')==name and w.get('path')==path)]
-    save_whitelist(new_wl)
-    self.refresh_whitelist_display(self.search_entry.get())
-    if self.ad: self.ad.refresh_whitelist()
-
 def create_shortcut(self):
     try:
         desktop = os.path.join(os.environ["USERPROFILE"], "Desktop")
