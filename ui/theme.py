@@ -20,10 +20,7 @@ WARM_YELLOW_THEME_JSON = r'''{
   "CTkTabview": {"fg_color": ["#2E2E2E", "#2E2E2E"], "border_color": ["#5E5E5E", "#5E5E5E"], "text_color": ["#FFFFFF", "#FFFFFF"], "segmented_button_fg_color": ["#3A3A3A", "#3A3A3A"], "segmented_button_selected_color": ["#E67E22", "#D35400"], "segmented_button_unselected_color": ["#3A3A3A", "#3A3A3A"], "segmented_button_hover_color": ["#F39C12", "#E67E22"]}
 }'''
 
-with open(THEME_WARM_YELLOW, 'w', encoding='utf-8') as f:
-    f.write(WARM_YELLOW_THEME_JSON)
-
-    THEME_PRESETS = {
+THEME_PRESETS = {
     'default': ("dark", "blue"),
     '绿色 (暗绿)': ("dark", "green"),
     '深色暖黄': ("dark", THEME_WARM_YELLOW),

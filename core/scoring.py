@@ -1,5 +1,6 @@
 import os, subprocess, time, threading
 from utils.config import load_config
+from utils.risk import get_risk_level
 
 class TrustedPublishers:
     STRONG_TRUSTED = {
@@ -143,8 +144,9 @@ class ScoringEngine:
 
     def _check_signature(self, exe_path):
         try:
+            safe_path = exe_path.replace("'", "''")
             ps_command = f"""
-$file = '{exe_path}'
+$file = '{safe_path}'
 if (Test-Path $file) {{
     $sig = Get-AuthenticodeSignature $file
     if ($sig.Status -eq 'Valid') {{ Write-Output "Valid" }}
@@ -249,7 +251,8 @@ class ProcessScoreTracker:
 
 class ProcessAnalyzer:
     def __init__(self):
-        self.profiler = ProcessProfiler()
+        # ProcessProfiler 已随 legacy_patch 移除，此处保留占位以避免实例化崩溃
+        self.profiler = None
         self.config = load_config()
 
     def calculate_risk(self, monitor):

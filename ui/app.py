@@ -80,12 +80,17 @@ def record_processes_for_30_seconds():
                 main_log(f"主动防御恢复失败: {e}")
         else:
             main_log(f"30秒记录完成，共添加 {count} 个新进程到白名单")
-        try:
-            popup.after(0, popup.destroy)
-        except RuntimeError:
-            pass
-        except:
-            pass
+        # 在主线程销毁弹窗，避免后台线程操作 tkinter 控件
+        app = getattr(sys, 'app', None)
+        if app:
+            app.after(0, popup.destroy)
+        else:
+            try:
+                popup.after(0, popup.destroy)
+            except RuntimeError:
+                pass
+            except:
+                pass
     threading.Thread(target=record, daemon=True).start()
 
 class VirusWiseApp(ctk.CTk):
@@ -717,18 +722,36 @@ class VirusWiseApp(ctk.CTk):
                 if not os.path.exists(autoruns_zip): self._download_autoruns(autoruns_zip)
                 self._extract_autoruns(autoruns_zip, DATA_DIR)
                 exe = self._find_autoruns_executable()
-            if exe: os.startfile(exe)
-            else: os.startfile(DATA_DIR)
+            if exe:
+                # 下载后必须验证数字签名，防止中间人篡改
+                if not check_digital_signature(exe):
+                    messagebox.showerror("错误", "Autoruns 数字签名验证失败，已放弃执行，可能是文件被篡改")
+                    return
+                os.startfile(exe)
+            else:
+                os.startfile(DATA_DIR)
         except Exception as e: messagebox.showerror("错误", str(e))
 
     def _download_autoruns(self, dest):
         r = requests.get("https://download.sysinternals.com/files/Autoruns.zip", stream=True, timeout=60)
         if r.status_code != 200: raise RuntimeError("下载失败")
+        # 校验 Content-Type 与大小（2.8MB 左右）
+        ctype = r.headers.get('Content-Type', '')
+        if 'zip' not in ctype.lower() and 'octet-stream' not in ctype.lower():
+            raise RuntimeError(f"下载内容类型异常: {ctype}")
         with open(dest, "wb") as f:
             for chunk in r.iter_content(8192): f.write(chunk)
+        return dest
 
     def _extract_autoruns(self, zip_path, to):
-        with zipfile.ZipFile(zip_path, "r") as z: z.extractall(to)
+        import zipfile as _zf
+        with _zf.ZipFile(zip_path, "r") as z:
+            for member in z.infolist():
+                # 防止 Zip Slip（路径遍历）
+                target = os.path.normpath(os.path.join(to, member.filename))
+                if not target.startswith(os.path.abspath(to) + os.sep) and target != os.path.abspath(to):
+                    raise RuntimeError(f"ZIP 条目路径不安全: {member.filename}")
+            z.extractall(to)
 
     def _find_autoruns_executable(self):
         for name in ["Autoruns64.exe", "Autoruns.exe"]:
@@ -1035,6 +1058,7 @@ class VirusWiseApp(ctk.CTk):
                     scan_log("等待分析完成...")
                     update_progress(70, "等待VT分析...")
                     analysis_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
+                    analysis_completed = False
                     for _ in range(20):
                         time.sleep(5)
                         analysis_r = requests.get(analysis_url, headers={"x-apikey": api_key}, timeout=30)
@@ -1052,8 +1076,11 @@ class VirusWiseApp(ctk.CTk):
                                     if malicious >= 6:
                                         self.danger_files.append({'path':target, 'type':"恶意(上传分析)", 'malicious':malicious, 'suspicious':suspicious, 'mode':'single'})
                                 scan_log(f"分析完成 - 恶意:{malicious}, 可疑:{suspicious}")
+                                analysis_completed = True
                                 break
                         time.sleep(5)
+                    if not analysis_completed:
+                        scan_log("VT 分析超时，未能在限定时间内获取结果")
                 else:
                     scan_log(f"上传失败 HTTP {upload_r.status_code}")
                 update_progress(100, "扫描完成")
@@ -1110,6 +1137,114 @@ class VirusWiseApp(ctk.CTk):
 
         update_progress(100, "扫描完成")
         scan_log(f"发现 {len(self.danger_files)} 个威胁")
+        self.after(0, self.refresh_list)
+
+    def folder_scan(self, target):
+        """扫描指定文件夹下所有文件（复用单文件查杀逻辑）。"""
+        self.danger_files = []
+        scan_log("="*50)
+        scan_log(f"文件夹查杀: {target}")
+        update_progress(0, "准备扫描...")
+
+        if not os.path.isdir(target):
+            scan_log("目标不是有效文件夹")
+            update_progress(0, "扫描已终止")
+            return
+
+        # 收集所有文件
+        files = []
+        for root, dirs, fs_ in os.walk(target):
+            for name in fs_:
+                files.append(os.path.join(root, name))
+
+        total = len(files)
+        if total == 0:
+            scan_log("文件夹为空")
+            update_progress(100, "扫描完成")
+            self.after(0, self.refresh_list)
+            return
+
+        scan_log(f"共发现 {total} 个文件，开始逐个查杀...")
+        whitelist = load_whitelist()
+        whitelist_hashes = {item.get('hash') for item in whitelist if item.get('hash')}
+        api_key = self.config.get('apikey', '').strip()
+        sensitive = self.config.get('sensitive', False)
+
+        for idx, fpath in enumerate(files, 1):
+            try:
+                prog = int(idx / total * 100)
+                update_progress(prog, f"扫描中 {idx}/{total}: {os.path.basename(fpath)}")
+
+                if not os.path.exists(fpath):
+                    continue
+                size = os.path.getsize(fpath)
+                h = get_file_hash(fpath)
+                if not h:
+                    continue
+                if h in whitelist_hashes:
+                    continue
+
+                # 查询 VT
+                url = f"{BASE_URL}/files/{h}"
+                headers = {"x-apikey": api_key}
+                try:
+                    r = requests.get(url, headers=headers, timeout=15)
+                    if r.status_code == 404:
+                        if size <= MAX_UPLOAD_SIZE and api_key:
+                            upload_r = requests.post(
+                                "https://www.virustotal.com/api/v3/files",
+                                headers={"x-apikey": api_key},
+                                files={'file': (os.path.basename(fpath), open(fpath, 'rb'))},
+                                timeout=30
+                            )
+                            if upload_r.status_code == 200:
+                                analysis_id = upload_r.json().get('data', {}).get('id', '')
+                                analyzed = False
+                                for _ in range(6):
+                                    time.sleep(5)
+                                    ar = requests.get(
+                                        f"{BASE_URL}/analyses/{analysis_id}",
+                                        headers=headers, timeout=15
+                                    )
+                                    if ar.status_code == 200:
+                                        status = ar.json().get('data', {}).get('attributes', {}).get('status', '')
+                                        if status == 'completed':
+                                            stats = ar.json().get('data', {}).get('attributes', {}).get('stats', {})
+                                            malicious = stats.get('malicious', 0)
+                                            threshold = 1 if sensitive else 6
+                                            if malicious >= threshold:
+                                                self.danger_files.append({
+                                                    'path': fpath,
+                                                    'type': f"恶意(文件夹查杀)",
+                                                    'malicious': malicious,
+                                                    'suspicious': stats.get('suspicious', 0),
+                                                    'mode': 'folder'
+                                                })
+                                            analyzed = True
+                                            break
+                                if not analyzed:
+                                    scan_log(f"VT 分析超时: {os.path.basename(fpath)}")
+                        continue
+                    if r.status_code == 200:
+                        data = r.json()
+                        stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
+                        malicious = stats.get("malicious", 0)
+                        threshold = 1 if sensitive else 6
+                        if malicious >= threshold:
+                            self.danger_files.append({
+                                'path': fpath,
+                                'type': "恶意",
+                                'malicious': malicious,
+                                'suspicious': stats.get('suspicious', 0),
+                                'mode': 'folder'
+                            })
+                except Exception as e:
+                    scan_log(f"查询 VT 出错 {os.path.basename(fpath)}: {e}")
+            except Exception as e:
+                scan_log(f"处理文件出错 {os.path.basename(fpath)}: {e}")
+
+        update_progress(100, "扫描完成")
+        scan_log(f"文件夹查杀完成，发现 {len(self.danger_files)} 个危险项")
         self.after(0, self.refresh_list)
 
     def destroy(self):

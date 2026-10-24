@@ -63,9 +63,14 @@ class DefenderScanner:
     def scan_drive(self, drive):
         threats = []
         try:
-            main_log(f"正在扫描 {drive} ...")
+            # 规范化路径，确保 MpCmdRun 能正确解析盘符/目录
+            norm_drive = os.path.normpath(drive)
+            if not os.path.exists(norm_drive):
+                main_log(f"扫描目标不存在: {drive}")
+                return threats
+            main_log(f"正在扫描 {norm_drive} ...")
             result = subprocess.run(
-                [self.mpcmdrun_path, '-Scan', '-ScanType', '3', '-File', drive],
+                [self.mpcmdrun_path, '-Scan', '-ScanType', '3', '-File', norm_drive],
                 capture_output=True, text=True, timeout=7200,
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
