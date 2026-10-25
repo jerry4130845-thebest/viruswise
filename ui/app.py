@@ -696,7 +696,7 @@ class VirusWiseApp(ctk.CTk):
     def create_shortcut(self):
         try:
             desktop = os.path.join(os.environ["USERPROFILE"], "Desktop")
-            bat_path = os.path.join(desktop, "VirusTotalSecurity.bat")
+            bat_path = os.path.join(desktop, "VirusWise.bat")
             target = sys.executable if getattr(sys, 'frozen', False) else sys.argv[0]
             with open(bat_path, "w", encoding="gbk") as f:
                 f.write(f'@echo off\ncd /d "{BASE_DIR}"\nstart "" "{target}"')

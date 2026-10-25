@@ -2,7 +2,6 @@ import subprocess
 
 def check_digital_signature(filepath):
     try:
-        # 将单引号翻倍以在 PowerShell 单引号字符串内转义，防止命令注入
         safe_path = filepath.replace("'", "''")
         ps_command = f"""
 $file = '{safe_path}'
