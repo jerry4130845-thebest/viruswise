@@ -13,7 +13,7 @@ from utils.config import load_config, save_config
 from utils.whitelist import load_whitelist, save_whitelist
 from utils.hash import get_file_hash
 from utils.quarantine import quarantine
-from utils.risk import get_risk_level
+from utils.risk import get_risk_level, SYSTEM_PROCESSES
 from utils.signature import check_digital_signature
 from utils.network import is_offline
 from utils.fake_log import is_fake_log
