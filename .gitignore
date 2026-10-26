@@ -4,3 +4,4 @@
 *.pyd
 **/data/
 **/quarantine/
+*.gitignore
