@@ -5,3 +5,4 @@
 **/data/
 **/quarantine/
 *.gitignore
+crash.log

@@ -54,6 +54,12 @@ def elevate_if_needed():
         return
     if is_admin():
         return
+    
+    # 增加非交互式检测
+    if not hasattr(sys, 'stdin') or sys.stdin is None or not sys.stdin.isatty():
+        print("未检测到交互式环境，无法自动提权。请尝试以管理员身份手动运行。")
+        return
+
     import ctypes
     try:
         script = os.path.abspath(sys.argv[0])

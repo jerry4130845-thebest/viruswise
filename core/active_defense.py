@@ -1,3 +1,4 @@
+import concurrent.futures
 import os, sys, time, threading, queue, hashlib
 from types import SimpleNamespace
 import psutil
@@ -95,6 +96,8 @@ class SystemMonitorHandler(FileSystemEventHandler):
             self._emit(e.src_path, 'deleted')
 
 
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+
 class ActiveDefense:
     def __init__(self):
         self.observer = None
@@ -110,11 +113,20 @@ class ActiveDefense:
         self.whitelist_hashes = set()
         self.whitelist_names = set()
         self.whitelist_paths = []
+        self.last_whitelist_mtime = 0
         self.refresh_whitelist()
 
         self.config = load_config()
 
     def refresh_whitelist(self):
+        try:
+            from utils.whitelist import WHITELIST_FILE
+            mtime = os.path.getmtime(WHITELIST_FILE)
+            if mtime == self.last_whitelist_mtime:
+                return
+            self.last_whitelist_mtime = mtime
+        except Exception:
+            pass
         wl = load_whitelist()
         self.whitelist_hashes = {item.get('hash') for item in wl if item.get('hash')}
         self.whitelist_names = {item.get('name', '').lower() for item in wl if item.get('name')}
@@ -370,20 +382,3 @@ class ActiveDefense:
                 pass
         except Exception as e:
             main_log(f"[保护告警] 异常: {e}")
-
-    def _monitor_startup_and_services(self):
-        while not self._stop:
-            try:
-                startup_paths = [
-                    os.path.expandvars(r'%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup'),
-                    os.path.expandvars(r'%PROGRAMDATA%\Microsoft\Windows\Start Menu\Programs\Startup'),
-                ]
-                for sp in startup_paths:
-                    if os.path.isdir(sp):
-                        for name in os.listdir(sp):
-                            full = os.path.join(sp, name)
-                            if get_risk_level(full) == 2:
-                                main_log(f"[启动项监控] 发现高风险启动项: {full}")
-            except Exception:
-                pass
-            time.sleep(10)
