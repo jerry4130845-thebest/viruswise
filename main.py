@@ -7,7 +7,6 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# ---- 目录初始化（原 legacy_patch.py:66-79）----
 from utils.paths import BASE_DIR, DATA_DIR, QUARANTINE_DIR, PROFILES_DIR, CRASH_LOG
 
 try:
@@ -18,7 +17,6 @@ except Exception as e:
     print(f"初始化目录失败: {e}")
     sys.exit(1)
 
-# ---- 全局异常钩子（原 legacy_patch.py:30-48）----
 def setup_exception_handler():
     def global_handler(exc_type, exc_value, exc_traceback):
         if issubclass(exc_type, KeyboardInterrupt):
@@ -40,7 +38,6 @@ def setup_exception_handler():
     sys.excepthook = global_handler
 
 
-# ---- 管理员提权（原 legacy_patch.py:85-98）----
 def is_admin():
     import ctypes
     try:
