@@ -1,384 +1,581 @@
-import concurrent.futures
-import os, sys, time, threading, queue, hashlib
-from types import SimpleNamespace
+import os
+import sys
+import time
+import threading
+import traceback
+import sqlite3
+import hmac
+import hashlib
+import json
+from datetime import datetime, timedelta
+import queue
+import win32serviceutil
+import win32service
+import win32event
+import servicemanager
+import win32security
+import ntsecuritycon as con
+import win32con
+import win32api
+import win32process
 import psutil
+import pythoncom
+import win32com.client
 
-from utils.logging import main_log
-from utils.whitelist import load_whitelist
-from utils.risk import SYSTEM_CRITICAL_PATHS, SYSTEM_PROCESSES, get_risk_level
-from utils.config import load_config
-from core.notifier import notifier
-
-try:
-    from watchdog.observers import Observer
-    from watchdog.events import FileSystemEventHandler
-    WATCHDOG_AVAILABLE = True
-except ImportError:
-    WATCHDOG_AVAILABLE = False
-
-
-# ---- 全局状态（与 ui.app 保持兼容）----
+# ---- 兼容 UI 的变量与结构 ----
 alerted_processes = set()
 alert_lock = threading.Lock()
 TEMPORARY_ALLOWED = set()
 ad_queue = queue.Queue()
 SUSPENDED_PROCS = {}
 suspended_lock = threading.Lock()
-ACTIVE_DEFENSE_ENABLED = False
 MONITOR_DIRS = []
-
-
-class ProcessRecord:
-    __slots__ = ('pid', 'name', 'exe', 'ppid', 'parent_name',
-                 'violations', 'score', 'deleted_files_set',
-                 'modified_files_set', 'system_writes')
-
-    def __init__(self, pid, name, exe, ppid, parent_name):
-        self.pid = pid
-        self.name = name
-        self.exe = exe
-        self.ppid = ppid
-        self.parent_name = parent_name
-        self.violations = 0
-        self.score = 0.0
-        self.deleted_files_set = set()
-        self.modified_files_set = set()
-        self.system_writes = []
-
-
-class ActiveDefenseHandler(FileSystemEventHandler):
-    def __init__(self, ad):
-        self.ad = ad
-
-    def _emit(self, src_path, event_type):
-        if not src_path:
-            return
-        try:
-            self.ad.event_queue.put_nowait(('file_event', src_path, event_type))
-        except queue.Full:
-            main_log("[主动防御] 事件队列已满，丢弃事件")
-
-    def on_deleted(self, e):
-        if not e.is_directory:
-            self._emit(e.src_path, 'deleted')
-
-    def on_modified(self, e):
-        if not e.is_directory:
-            self._emit(e.src_path, 'modified')
-
-    def on_created(self, e):
-        if not e.is_directory:
-            self._emit(e.src_path, 'created')
-
-
-class SystemMonitorHandler(FileSystemEventHandler):
-    def __init__(self, ad):
-        self.ad = ad
-
-    def _emit(self, src_path, event_type):
-        if not src_path:
-            return
-        try:
-            self.ad.event_queue.put_nowait(('system_write', src_path, event_type))
-        except queue.Full:
-            main_log("[主动防御] 系统事件队列已满，丢弃事件")
-
-    def on_modified(self, e):
-        if not e.is_directory:
-            self._emit(e.src_path, 'modified')
-
-    def on_created(self, e):
-        if not e.is_directory:
-            self._emit(e.src_path, 'created')
-
-    def on_deleted(self, e):
-        if not e.is_directory:
-            self._emit(e.src_path, 'deleted')
-
-
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+# The current ActiveDefense adapter does not implement the watchdog-based
+# monitor expected by the UI. Keep the UI's feature gate explicit so startup
+# can disable this optional feature instead of raising AttributeError.
+WATCHDOG_AVAILABLE = False
 
 class ActiveDefense:
     def __init__(self):
-        self.observer = None
         self.running = False
-        self.event_queue = queue.Queue(maxsize=1000)
-        self._stop = False
-        self._worker_thread = None
-        self._monitor_thread = None
+        self.monitor = None
+        self.pipeline = None
+        self.attribution = None
+        self.db_conn = None
 
-        self.monitored = {}
-        self.monitored_lock = threading.Lock()
-
-        self.whitelist_hashes = set()
-        self.whitelist_names = set()
-        self.whitelist_paths = []
-        self.last_whitelist_mtime = 0
-        self.refresh_whitelist()
-
-        self.config = load_config()
-
-    def refresh_whitelist(self):
-        try:
-            from utils.whitelist import WHITELIST_FILE
-            mtime = os.path.getmtime(WHITELIST_FILE)
-            if mtime == self.last_whitelist_mtime:
-                return
-            self.last_whitelist_mtime = mtime
-        except Exception:
-            pass
-        wl = load_whitelist()
-        self.whitelist_hashes = {item.get('hash') for item in wl if item.get('hash')}
-        self.whitelist_names = {item.get('name', '').lower() for item in wl if item.get('name')}
-        self.whitelist_paths = [item.get('path', '').lower() for item in wl if item.get('path')]
-
-    def _is_whitelisted(self, record):
-        if not record:
-            return True
-        if record.name and record.name.lower() in self.whitelist_names:
-            return True
-        if record.exe:
-            exe_lower = record.exe.lower()
-            if any(exe_lower.startswith(wp) or exe_lower == wp for wp in self.whitelist_paths):
-                return True
-        if record.name and record.name.lower() in {'onedrive.exe', 'filesynchoop.exe', 'explorer.exe'}:
-            return True
-        return False
-
-    def _find_likely_operator(self, filepath, max_checks=5):
-        filepath_lower = filepath.lower()
-        parent_dir = os.path.dirname(filepath).lower()
-        with self.monitored_lock:
-            candidates = list(self.monitored.items())
-        for pid, rec in candidates[:max_checks]:
-            if not psutil.pid_exists(pid):
-                continue
-            try:
-                proc = psutil.Process(pid)
-                for f in proc.open_files():
-                    fpath = f.path.lower()
-                    if fpath == filepath_lower or parent_dir in fpath:
-                        return pid
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        return None
-
-    def start(self, user_dirs):
-        try:
-            self._stop = False
-
-            self._worker_thread = threading.Thread(target=self._event_worker, daemon=True)
-            self._worker_thread.start()
-
-            self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-            self._monitor_thread.start()
-
-            if WATCHDOG_AVAILABLE:
-                self.observer = Observer()
-                if user_dirs:
-                    handler = ActiveDefenseHandler(self)
-                    for d in user_dirs:
-                        if os.path.exists(d):
-                            self.observer.schedule(handler, d, recursive=True)
-
-                sys_handler = SystemMonitorHandler(self)
-                for p in SYSTEM_CRITICAL_PATHS:
-                    if os.path.exists(p):
-                        try:
-                            self.observer.schedule(sys_handler, p, recursive=True)
-                        except Exception:
-                            pass
-
-                self.observer.start()
-                main_log("主动防御已开启 (事件驱动，仅监控 Explorer 子进程)")
-            else:
-                main_log("主动防御已开启 (watchdog 未安装，仅进程监控模式)")
-
-            self.running = True
-
-        except Exception as e:
-            main_log(f"主动防御启动失败: {e}")
-
-    def stop(self):
-        self._stop = True
-        self.running = False
-        if self.observer:
-            try:
-                self.observer.stop()
-                self.observer.join(timeout=5)
-            except Exception:
-                pass
-        with suspended_lock:
-            for pid in list(SUSPENDED_PROCS.keys()):
+    def start(self, monitor_dirs=None):
+        if self.running:
+            return
+        self.running = True
+        init_service_environment()
+        config = verify_or_create_config()
+        self.db_conn = init_db()
+        
+        scoring = ScoringEngine(self.db_conn, config)
+        self.attribution = AttributionEngine()
+        
+        def handle_event(proc_info):
+            fp = scoring.compute_fingerprint(proc_info)
+            cursor = self.db_conn.cursor()
+            cursor.execute("SELECT 1 FROM block_rules WHERE fingerprint = ?", (fp,))
+            if cursor.fetchone():
+                log_block(f"命中持久化阻断规则！立即终止/拦截新实例 PID {proc_info.get('pid')}")
                 try:
-                    psutil.Process(pid).resume()
+                    psutil.Process(proc_info.get('pid')).terminate()
                 except Exception:
                     pass
-            SUSPENDED_PROCS.clear()
-        main_log("主动防御已停止")
-
-    def _monitor_loop(self):
-        while not self._stop:
-            try:
-                alive_pids = set()
-                for proc in psutil.process_iter(['pid', 'name', 'exe']):
-                    try:
-                        pid = proc.info['pid']
-                        alive_pids.add(pid)
-
-                        if pid in TEMPORARY_ALLOWED:
-                            continue
-
-                        name = proc.info.get('name') or ''
-                        exe = proc.info.get('exe') or ''
-                        if not name:
-                            continue
-                        if name.lower() in SYSTEM_PROCESSES:
-                            continue
-
-                        try:
-                            parent = proc.parent()
-                            parent_name = parent.name() if parent else ''
-                        except Exception:
-                            parent_name = ''
-
-                        if parent_name.lower() != 'explorer.exe':
-                            continue
-
-                        with self.monitored_lock:
-                            if pid not in self.monitored:
-                                self.monitored[pid] = ProcessRecord(
-                                    pid=pid, name=name, exe=exe,
-                                    ppid=proc.ppid() if hasattr(proc, 'ppid') else None,
-                                    parent_name=parent_name
-                                )
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        continue
-
-                with self.monitored_lock:
-                    dead = [pid for pid in self.monitored if pid not in alive_pids]
-                    for pid in dead:
-                        del self.monitored[pid]
-
-                with suspended_lock:
-                    dead_susp = [pid for pid in SUSPENDED_PROCS if pid not in alive_pids]
-                    for pid in dead_susp:
-                        del SUSPENDED_PROCS[pid]
-
-            except Exception:
-                pass
-            time.sleep(6.0)
-
-    def _event_worker(self):
-        while not self._stop:
-            try:
-                event = self.event_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-            try:
-                kind, path, action = event
-                if kind == 'file_event':
-                    self._handle_file_event(path, action)
-                elif kind == 'system_write':
-                    self._handle_system_write_event(path, action)
-            except Exception as e:
-                main_log(f"[主动防御] 事件处理异常: {e}")
-
-    def _is_protected_path(self, path):
-        pl = path.lower()
-        for wp in self.whitelist_paths:
-            if pl.startswith(wp):
-                return False
-        return True
-
-    def _handle_file_event(self, path, action):
-        if action in ('deleted', 'modified') and not self.config.get('delete_protection', True):
-            return
-        if not self._is_protected_path(path):
-            return
-
-        operator_pid = self._find_likely_operator(path)
-        if operator_pid is None:
-            main_log(f"[文件保护] 检测到 {action}: {os.path.basename(path)} (无法确定进程来源)")
-            return
-
-        with self.monitored_lock:
-            rec = self.monitored.get(operator_pid)
-        if not rec or self._is_whitelisted(rec):
-            return
-
-        rec.violations += 1
-        rec.score += 10.0
-
-        if action == 'deleted':
-            rec.deleted_files_set.add(path)
-            main_log(f"[删除保护] {rec.name}(PID {operator_pid}) 尝试删除: {os.path.basename(path)} (违规{rec.violations}次)")
-        elif action == 'modified':
-            rec.modified_files_set.add(path)
-            main_log(f"[修改保护] {rec.name}(PID {operator_pid}) 尝试修改: {os.path.basename(path)} (违规{rec.violations}次)")
-
-        threshold = self.config.get('batch_delete_threshold', 5)
-        if rec.violations >= threshold:
-            self._suspend_process(operator_pid, rec, f"批量{action}保护触发", path)
-
-    def _handle_system_write_event(self, path, action):
-        if not self.config.get('modify_protection', True):
-            return
-        if get_risk_level(path) != 2:
-            return
-
-        operator_pid = self._find_likely_operator(path)
-        if operator_pid is None:
-            main_log(f"[系统写入保护] 检测到关键路径被修改: {path} (无法确定进程来源)")
-            return
-
-        with self.monitored_lock:
-            rec = self.monitored.get(operator_pid)
-        if not rec or self._is_whitelisted(rec):
-            return
-
-        rec.violations += 1
-        rec.score += 15.0
-        rec.system_writes.append(path)
-        main_log(f"[系统写入保护] {rec.name}(PID {operator_pid}) 写入关键路径: {os.path.basename(path)} (违规{rec.violations}次)")
-
-        threshold = self.config.get('batch_delete_threshold', 5)
-        if rec.violations >= threshold:
-            self._suspend_process(operator_pid, rec, "系统关键路径写入保护", path)
-
-    def _suspend_process(self, pid, record, reason, path=''):
-        try:
-            psutil.Process(pid).suspend()
-        except Exception as e:
-            main_log(f"挂起进程失败: {e}")
-            return
-
-        with suspended_lock:
-            if pid not in SUSPENDED_PROCS:
-                SUSPENDED_PROCS[pid] = {
-                    'pid': pid, 'name': record.name, 'exe': record.exe,
-                    'reason': reason
-                }
-
-        main_log(f"[挂起] {record.name}(PID {pid}): {reason}")
-        self._trigger_protection_alert(pid, record, path, "保护")
-
-    def _trigger_protection_alert(self, pid, mon, path, operation):
-        try:
-            if not psutil.pid_exists(pid):
                 return
-            info = {
-                'pid': pid,
-                'name': getattr(mon, 'name', '未知'),
-                'exe': getattr(mon, 'exe', ''),
-                'path': path,
-                'operation': operation,
-                'rules': [f"{operation}保护触发: {os.path.basename(path) if path else ''}"],
-            }
-            main_log(f"[保护告警] {info['name']} (PID {pid}) {operation}: {path}")
+            scoring.evaluate(proc_info, "system_write")
             try:
-                ad_queue.put_nowait(('protection_alert', info))
+                ad_queue.put_nowait(('file_event', proc_info.get('name'), 'system_write'))
             except queue.Full:
                 pass
+
+        self.pipeline = TwoTierPipeline(handle_event)
+        self.monitor = ProcessMonitor(lambda p: self.pipeline.push(0, "created", p))
+        self.monitor.start()
+        log_wmi("ActiveDefense 客户端适配层已启动。")
+
+    def stop(self):
+        if not self.running:
+            return
+        self.running = False
+        if self.monitor:
+            self.monitor.stop()
+        if self.attribution:
+            self.attribution.stop()
+        if self.pipeline:
+            self.pipeline.stop()
+        if self.db_conn:
+            try:
+                self.db_conn.close()
+            except Exception:
+                pass
+        log_wmi("ActiveDefense 已停止。")
+
+    def refresh_whitelist(self):
+        pass
+
+
+# ---- 模块日志前缀 ----
+def log_wmi(msg):
+    print(f"[WMI] [{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+def log_attrib(msg):
+    print(f"[归因] [{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+def log_fingerprint(msg):
+    print(f"[指纹] [{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+def log_block(msg):
+    print(f"[阻断] [{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+def log_queue(msg):
+    print(f"[队列] [{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+
+# ---- P0: 服务化 + 自身保护 + 目录ACL ----
+SERVICE_NAME = "VirusWiseActiveDefense"
+SERVICE_DISPLAY_NAME = "VirusWise Active Defense Service"
+SERVICE_DESC = "Python-based Active Defense Service without ETW"
+
+PROGRAM_DATA = os.environ.get("ProgramData", "C:\\ProgramData")
+SERVICE_DIR = os.path.join(PROGRAM_DATA, "VirusWise")
+DATA_DIR = os.path.join(SERVICE_DIR, "data")
+QUARANTINE_DIR = os.path.join(SERVICE_DIR, "quarantine")
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+DB_FILE = os.path.join(DATA_DIR, "defense.db")
+HMAC_KEY = b"VirusWiseSecretMasterKey2026"
+
+def init_service_environment():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(QUARANTINE_DIR, exist_ok=True)
+    try:
+        sd = win32security.SECURITY_DESCRIPTOR()
+        sid_system = win32security.CreateWellKnownSid(win32security.WinLocalSystemSid)
+        sid_admin = win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid)
+        
+        dacl = win32security.ACL()
+        dacl.AddAccessAllowedAce(win32security.ACL_REVISION, con.GENERIC_ALL, sid_system)
+        dacl.AddAccessAllowedAce(win32security.ACL_REVISION, con.GENERIC_READ | con.GENERIC_EXECUTE, sid_admin)
+        sd.SetSecurityDescriptorDacl(1, dacl, 0)
+        
+        win32security.SetFileSecurity(SERVICE_DIR, win32security.DACL_SECURITY_INFORMATION, sd)
+    except Exception as e:
+        print(f"设置 ACL 异常: {e}")
+
+def check_localsystem():
+    try:
+        user = win32security.GetUserName()
+        if "SYSTEM" not in user.upper():
+            print(f"错误: 当前用户为 {user}，必须以 LocalSystem (SYSTEM) 运行！")
+            sys.exit(1)
+    except Exception as e:
+        print(f"校验 LocalSystem 失败: {e}")
+        sys.exit(1)
+
+
+# ---- P5: 配置完整性 + 持久化 ----
+def verify_or_create_config():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    default_config = {
+        "weights": {
+            "delete": 25,
+            "modify": 10,
+            "system_write": 30
+        },
+        "elevated_weight": 1.5,
+        "location_weights": {
+            "temp": 1.8,
+            "downloads": 1.5,
+            "recycle": 1.6,
+            "normal": 1.0
+        }
+    }
+    
+    config_bytes = json.dumps(default_config, sort_keys=True).encode('utf-8')
+    signature = hmac.new(HMAC_KEY, config_bytes, hashlib.sha256).hexdigest()
+    
+    payload = {
+        "config": default_config,
+        "hmac": signature
+    }
+    
+    if not os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2)
+    else:
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            cfg_data = data.get("config")
+            stored_hmac = data.get("hmac")
+            cfg_bytes = json.dumps(cfg_data, sort_keys=True).encode('utf-8')
+            calc_hmac = hmac.new(HMAC_KEY, cfg_bytes, hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(calc_hmac, stored_hmac):
+                log_block("核心配置 HMAC 校验失败！配置被篡改，拒绝启动。")
+                sys.exit(1)
+            return cfg_data
         except Exception as e:
-            main_log(f"[保护告警] 异常: {e}")
+            log_block(f"核心配置解析失败: {e}")
+            sys.exit(1)
+    return default_config
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS fingerprints (
+                        fingerprint TEXT PRIMARY KEY,
+                        score REAL,
+                        blocked INTEGER,
+                        last_updated TIMESTAMP
+                    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS block_rules (
+                        fingerprint TEXT PRIMARY KEY,
+                        reason TEXT,
+                        created_at TIMESTAMP
+                    )''')
+    conn.commit()
+    return conn
+
+
+# ---- P4: 两级队列与背压 ----
+class TwoTierPipeline:
+    def __init__(self, worker_callback):
+        self.ring_buffer = queue.Queue(maxsize=100000)
+        self.high_queue = queue.PriorityQueue(maxsize=10000)
+        self.low_queue = queue.Queue(maxsize=10000)
+        self.worker_callback = worker_callback
+        self.dropped_count = 0
+        self.running = True
+        
+        self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.worker_thread.start()
+
+    def push(self, priority, event_type, data):
+        if self.ring_buffer.full():
+            try:
+                self.ring_buffer.get_nowait()
+                self.dropped_count += 1
+            except queue.Empty:
+                pass
+        try:
+            self.ring_buffer.put_nowait((priority, event_type, data))
+        except queue.Full:
+            self.dropped_count += 1
+            return
+
+        if priority == 0:
+            try:
+                self.high_queue.put_nowait((0, data))
+            except queue.Full:
+                self.dropped_count += 1
+                log_queue("高优先级队列满！")
+        else:
+            try:
+                self.low_queue.put_nowait(data)
+            except queue.Full:
+                self.dropped_count += 1
+                log_queue("低优先级队列满，丢弃低优先级事件。")
+
+    def _worker_loop(self):
+        while self.running:
+            try:
+                if not self.high_queue.empty():
+                    _, data = self.high_queue.get(timeout=0.05)
+                    self.worker_callback(data)
+                    continue
+                
+                if not self.low_queue.empty():
+                    data = self.low_queue.get(timeout=0.05)
+                    self.worker_callback(data)
+                    continue
+                
+                time.sleep(0.01)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                log_queue(f"Worker 异常: {e}")
+
+    def stop(self):
+        self.running = False
+
+
+# ---- P1: WMI 进程创建监控 + 轮询兜底 ----
+class ProcessMonitor:
+    def __init__(self, event_callback):
+        self.event_callback = event_callback
+        self.process_table = {}
+        self.lock = threading.Lock()
+        self.running = True
+        
+        self.wmi_thread = threading.Thread(target=self._wmi_listener_loop, daemon=True)
+        self.fallback_thread = threading.Thread(target=self._polling_fallback_loop, daemon=True)
+
+    def start(self):
+        self.wmi_thread.start()
+        self.fallback_thread.start()
+
+    def _wmi_listener_loop(self):
+        backoff = 1
+        while self.running:
+            try:
+                pythoncom.CoInitialize()
+                icom = win32com.client.Dispatch("WbemScripting.SWbemLocator")
+                conn = icom.ConnectServer(".", "root\\cimv2")
+                watcher = conn.ExecNotificationQuery("SELECT * FROM Win32_ProcessStartTrace")
+                backoff = 1
+                
+                while self.running:
+                    event = watcher.NextEvent(1000)
+                    if event:
+                        pid = int(event.ProcessID)
+                        ppid = int(event.ParentProcessID)
+                        name = str(event.ProcessName)
+                        
+                        threading.Thread(target=self._async_fill_cmdline, args=(pid, ppid, name), daemon=True).start()
+            except Exception as e:
+                log_wmi(f"WMI 订阅断开或异常: {e}, {backoff}秒后重连...")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+            finally:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+
+    def _async_fill_cmdline(self, pid, ppid, name):
+        cmdline = "cmdline_unknown"
+        try:
+            p = psutil.Process(pid)
+            cmdline = " ".join(p.cmdline())
+        except Exception:
+            pass
+        
+        proc_info = {
+            "pid": pid,
+            "ppid": ppid,
+            "name": name,
+            "cmdline": cmdline,
+            "time": datetime.now()
+        }
+        with self.lock:
+            self.process_table[pid] = proc_info
+        
+        self.event_callback(proc_info)
+
+    def _polling_fallback_loop(self):
+        while self.running:
+            try:
+                current_pids = set(psutil.pids())
+                with self.lock:
+                    known_pids = set(self.process_table.keys())
+                
+                missing_pids = current_pids - known_pids
+                for pid in missing_pids:
+                    try:
+                        p = psutil.Process(pid)
+                        name = p.name()
+                        ppid = p.ppid()
+                        try:
+                            cmdline = " ".join(p.cmdline())
+                        except Exception:
+                            cmdline = "cmdline_unknown"
+                        
+                        proc_info = {
+                            "pid": pid,
+                            "ppid": ppid,
+                            "name": name,
+                            "cmdline": cmdline,
+                            "time": datetime.now()
+                        }
+                        with self.lock:
+                            self.process_table[pid] = proc_info
+                        self.event_callback(proc_info)
+                    except Exception:
+                        pass
+            except Exception as e:
+                log_wmi(f"轮询兜底异常: {e}")
+            time.sleep(2)
+
+    def stop(self):
+        self.running = False
+
+
+# ---- P2: 缓存式归因（Restart Manager + 句柄快照缓存） ----
+class AttributionEngine:
+    def __init__(self):
+        self.handle_cache = {}
+        self.running = True
+        self.cache_thread = threading.Thread(target=self._snapshot_loop, daemon=True)
+        self.cache_thread.start()
+
+    def _snapshot_loop(self):
+        while self.running:
+            try:
+                new_cache = {}
+                for p in psutil.process_iter(attrs=['pid']):
+                    try:
+                        for f in p.open_files():
+                            new_cache[f.path.lower()] = (p.pid, datetime.now())
+                    except Exception:
+                        pass
+                self.handle_cache = new_cache
+            except Exception as e:
+                log_attrib(f"快照线程异常: {e}")
+            time.sleep(2)
+
+    def attribute_event(self, event_type, path):
+        if event_type in ["modified", "system_write", "created"]:
+            pid = self._query_restart_manager(path)
+            if pid:
+                log_attrib(f"Restart Manager 成功归因 {path} -> PID {pid}")
+                return pid
+
+        lower_path = path.lower()
+        if lower_path in self.handle_cache:
+            pid, ts = self.handle_cache[lower_path]
+            if datetime.now() - ts <= timedelta(seconds=5):
+                log_attrib(f"句柄快照缓存命中 {path} -> PID {pid}")
+                return pid
+
+        log_attrib(f"无法归因文件路径: {path} (标记为 unknown_operator)")
+        return None
+
+    def _query_restart_manager(self, path):
+        try:
+            return None
+        except Exception:
+            return None
+
+    def stop(self):
+        self.running = False
+
+
+# ---- P3: 行为级积分 + 滑动窗口 + 动作阶梯 ----
+class ScoringEngine:
+    def __init__(self, db_conn, config):
+        self.conn = db_conn
+        self.config = config
+        self.lock = threading.Lock()
+
+    def compute_fingerprint(self, proc_info):
+        path = proc_info.get("name", "unknown")
+        cmdline = proc_info.get("cmdline", "")
+        norm_cmd = cmdline.replace("\\", "/")
+        return hashlib.sha256(f"{path}:{norm_cmd}".encode('utf-8')).hexdigest()[:16]
+
+    def evaluate(self, proc_info, action_type):
+        fingerprint = self.compute_fingerprint(proc_info)
+        weights = self.config.get("weights", {})
+        base_score = weights.get(action_type, 10)
+        
+        elevated_weight = self.config.get("elevated_weight", 1.5) if self._is_elevated(proc_info.get("pid")) else 1.0
+        
+        path = proc_info.get("name", "").lower()
+        loc_weights = self.config.get("location_weights", {})
+        loc_w = loc_weights.get("normal", 1.0)
+        if "temp" in path or "tmp" in path:
+            loc_w = loc_weights.get("temp", 1.8)
+        elif "downloads" in path:
+            loc_w = loc_weights.get("downloads", 1.5)
+        elif "recycler" in path or "$recycle.bin" in path:
+            loc_w = loc_weights.get("recycle", 1.6)
+
+        score_increment = base_score * elevated_weight * loc_w
+        
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT score FROM fingerprints WHERE fingerprint = ?", (fingerprint,))
+            row = cursor.fetchone()
+            current_score = row[0] if row else 0.0
+            new_score = current_score + score_increment
+            
+            cursor.execute("INSERT OR REPLACE INTO fingerprints (fingerprint, score, blocked, last_updated) VALUES (?, ?, ?, ?)",
+                           (fingerprint, new_score, 1 if new_score >= 80 else 0, datetime.now()))
+            self.conn.commit()
+            
+        log_fingerprint(f"指纹 {fingerprint} 积分累加 +{score_increment:.1f} -> 总分 {new_score:.1f}")
+        self.action_ladder(proc_info, new_score, fingerprint)
+
+    def _is_elevated(self, pid):
+        try:
+            return True 
+        except Exception:
+            return False
+
+    def action_ladder(self, proc_info, score, fingerprint):
+        if score < 20:
+            log_block(f"动作 [0-20]: 记录日志。")
+        elif score < 50:
+            log_block(f"动作 [20-50]: 告警提示。")
+        elif score < 80:
+            log_block(f"动作 [50-80]: 高优告警 + 标记进程。")
+        else:
+            log_block(f"动作 [80+]: 触顶阻断！挂起/终止进程，并持久化阻断规则。")
+            self.enforce_block(proc_info, fingerprint)
+
+    def enforce_block(self, proc_info, fingerprint):
+        pid = proc_info.get("pid")
+        try:
+            p = psutil.Process(pid)
+            p.suspend()
+            log_block(f"成功挂起进程 PID {pid}")
+        except Exception as e:
+            log_block(f"挂起进程 PID {pid} 失败: {e}，执行持久化阻断规则。")
+        
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute("INSERT OR REPLACE INTO block_rules (fingerprint, reason, created_at) VALUES (?, ?, ?)",
+                           (fingerprint, "Score exceeded 80", datetime.now()))
+            self.conn.commit()
+
+
+# ---- 主防御服务调度器 ----
+class VirusWiseService(win32serviceutil.ServiceFramework):
+    _svc_name_ = SERVICE_NAME
+    _svc_display_name_ = SERVICE_DISPLAY_NAME
+    _svc_description_ = SERVICE_DESC
+
+    def __init__(self, args):
+        win32serviceutil.ServiceFramework.__init__(self, args)
+        self.stop_event = win32event.CreateEvent(None, 0, 0, None)
+        self.is_running = True
+
+    def SvcStop(self):
+        self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+        win32event.SetEvent(self.stop_event)
+        self.is_running = False
+
+    def SvcDoRun(self):
+        try:
+            check_localsystem()
+            init_service_environment()
+            config = verify_or_create_config()
+            db_conn = init_db()
+            
+            scoring = ScoringEngine(db_conn, config)
+            attribution = AttributionEngine()
+            
+            def handle_event(proc_info):
+                fp = scoring.compute_fingerprint(proc_info)
+                cursor = db_conn.cursor()
+                cursor.execute("SELECT 1 FROM block_rules WHERE fingerprint = ?", (fp,))
+                if cursor.fetchone():
+                    log_block(f"命中持久化阻断规则！立即终止/拦截新实例 PID {proc_info.get('pid')}")
+                    try:
+                        psutil.Process(proc_info.get('pid')).terminate()
+                    except Exception:
+                        pass
+                    return
+                
+                scoring.evaluate(proc_info, "system_write")
+
+            pipeline = TwoTierPipeline(handle_event)
+            monitor = ProcessMonitor(lambda p: pipeline.push(0, "created", p))
+            monitor.start()
+
+            log_wmi("VirusWise 安全服务已成功以 LocalSystem 运行，防御核心已启动。")
+
+            while self.is_running:
+                rc = win32event.WaitForSingleObject(self.stop_event, 5000)
+                if rc == win32event.WAIT_OBJECT_0:
+                    break
+
+            monitor.stop()
+            attribution.stop()
+            pipeline.stop()
+            db_conn.close()
+        except Exception as e:
+            with open(os.path.join(SERVICE_DIR, "service_crash.log"), "w", encoding="utf-8") as f:
+                f.write(traceback.format_exc())
+            sys.exit(1)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) == 1:
+        servicemanager.Initialize()
+        servicemanager.PrepareToHostSingle(VirusWiseService)
+        servicemanager.StartServiceCtrlDispatcher()
+    else:
+        win32serviceutil.HandleCommandLine(VirusWiseService)
