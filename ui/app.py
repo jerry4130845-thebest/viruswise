@@ -4,7 +4,9 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 import tkinter as tk
 from tkinter import messagebox, filedialog, ttk
-from types import SimpleNamespace
+from types import SimpleNamespace, MappingProxyType
+from collections import deque
+from uuid import uuid4
 import customtkinter as ctk
 import psutil
 import requests
@@ -110,6 +112,18 @@ class VirusWiseApp(ctk.CTk):
 
         self.danger_files = []
         self.file_checkbuttons = []
+        self.scan_results = []
+        self._checkboxes = {}
+        self._selection = {}
+        self._scan_id = 0
+        self._render_generation = 0
+        self._render_timer = None
+        self._scan_ui_timer = None
+        self._scan_events = queue.Queue(maxsize=256)
+        self._scan_cancel = threading.Event()
+        self._signature_cancel = threading.Event()
+        self._scan_workers = set()
+        self._closing = False
         self.ad = None
         self.scanning = False
         self.ad_restarting = False
@@ -123,6 +137,7 @@ class VirusWiseApp(ctk.CTk):
         self._build_ui()
         self._init_defender_check()
         self._start_timers()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
 
         watchdog_available = admod.WATCHDOG_AVAILABLE
         if admod.ACTIVE_DEFENSE_ENABLED and watchdog_available:
@@ -181,7 +196,7 @@ class VirusWiseApp(ctk.CTk):
         frame = ctk.CTkFrame(self.content_frame)
         self.main_log_box = ctk.CTkTextbox(frame, wrap="word")
         self.main_log_box.pack(expand=True, fill="both", padx=10, pady=10)
-        ctk.CTkButton(frame, text="退出程序", command=self.quit).pack(pady=10)
+        ctk.CTkButton(frame, text="退出程序", command=self.destroy).pack(pady=10)
         return frame
     def _build_scan_page(self):
         frame = ctk.CTkFrame(self.content_frame)
@@ -213,6 +228,8 @@ class VirusWiseApp(ctk.CTk):
         btn_frame.pack(fill="x", padx=10, pady=5)
         self.exec_btn = ctk.CTkButton(btn_frame, text="执行扫描", command=self.start_scan_thread)
         self.exec_btn.pack(side="left", padx=5)
+        self.cancel_btn = ctk.CTkButton(btn_frame, text="取消扫描", width=90, command=self.cancel_scan, state="disabled")
+        self.cancel_btn.pack(side="left", padx=5)
         self.sel_btn = ctk.CTkButton(btn_frame, text="全选/取消", width=100, command=self.toggle_all)
         self.sel_btn.pack(side="left", padx=5)
         self.proc_btn = ctk.CTkButton(btn_frame, text="一键处理", width=100, command=self.process_selected)
@@ -583,8 +600,11 @@ class VirusWiseApp(ctk.CTk):
         with suspended_lock:
             if pid in SUSPENDED_PROCS: del SUSPENDED_PROCS[pid]
         with alert_lock: alerted_processes.discard(pid)
-        if quarantine(info['exe']): messagebox.showinfo("成功", "已隔离病毒")
-        else: messagebox.showerror("失败", "隔离失败")
+        result = quarantine(info['exe'])
+        if result["status"] == "isolated":
+            messagebox.showinfo("成功", "已隔离病毒")
+        else:
+            messagebox.showerror("未完成隔离", result.get("error") or "原文件未移除")
         top.destroy()
 
     def alert_online(self, info):
@@ -826,6 +846,7 @@ class VirusWiseApp(ctk.CTk):
             main_log(f"清理rickroll弹窗失败: {e}")
 
     def _start_timers(self):
+        self._drain_scan_events()
         self._check_ad_queue()
         self._start_suspended_refresh()
 
@@ -897,368 +918,446 @@ class VirusWiseApp(ctk.CTk):
         except Exception as e:
             main_log(f"延迟启动主动防御失败: {e}")
 
+    def _post_scan_event(self, scan_id, kind, payload, cancel=None):
+        # Workers only touch this bounded Python queue, never Tk or the result model.
+        while not self._closing and scan_id == self._scan_id:
+            if cancel is not None and cancel.is_set():
+                return
+            try:
+                self._scan_events.put((scan_id, kind, payload), timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
+    def _drain_scan_events(self):
+        if self._closing:
+            return
+        for _ in range(100):
+            try:
+                scan_id, kind, payload = self._scan_events.get_nowait()
+            except queue.Empty:
+                break
+            if scan_id != self._scan_id:
+                continue
+            if kind == "log":
+                self.scan_log_box.insert("end", str(payload) + "\n")
+            elif kind == "progress":
+                self._set_progress(*payload)
+            elif kind == "done":
+                self._finish_scan(payload)
+            elif kind == "signatures":
+                generation, updates = payload
+                if generation == self._render_generation:
+                    for item_id, text in updates:
+                        cb = self._checkboxes.get(item_id)
+                        if cb is not None:
+                            cb.configure(text=text)
+        self._scan_workers = {t for t in self._scan_workers if t.is_alive()}
+        self._scan_ui_timer = self.after(50, self._drain_scan_events)
+
+    def _start_scan_worker(self, target, *args):
+        worker = threading.Thread(target=target, args=args, daemon=True)
+        self._scan_workers.add(worker)
+        try:
+            worker.start()
+        except Exception:
+            self._scan_workers.discard(worker)
+            raise
+
+    def _cancel_render(self):
+        self._render_generation += 1
+        self._signature_cancel.set()
+        if self._render_timer is not None:
+            self.after_cancel(self._render_timer)
+            self._render_timer = None
+
     def _clear_scan_results(self):
-        for widget in self.file_scroll_frame.winfo_children(): widget.destroy()
+        self._cancel_render()
+        for widget in self.file_scroll_frame.winfo_children():
+            widget.destroy()
         self.file_checkbuttons.clear()
+        self._checkboxes.clear()
+        self._selection.clear()
         self.danger_files.clear()
+        self.scan_results.clear()
         self.proc_btn.configure(state="disabled")
         self.scan_log_box.delete("1.0", "end")
         self._set_progress(0, "准备就绪")
 
     def prepare_scan_ui(self):
-        self.after(0, self._clear_scan_results)
+        # Called by the UI thread before a worker can publish anything.
+        self._clear_scan_results()
+
+    def _remember_selection(self):
+        for item_id, cb in self._checkboxes.items():
+            self._selection[item_id] = bool(cb.get())
 
     def toggle_all(self):
-        if not self.danger_files: return
-        new_state = not all(cb.get() for cb in self.file_checkbuttons)
-        for cb in self.file_checkbuttons:
-            if new_state: cb.select()
-            else: cb.deselect()
+        self._remember_selection()
+        eligible = [f['item_id'] for f in self.danger_files if f.get('can_quarantine')]
+        new_state = not all(self._selection.get(item_id, False) for item_id in eligible)
+        for item_id in eligible:
+            self._selection[item_id] = new_state
+            cb = self._checkboxes.get(item_id)
+            if cb is not None:
+                cb.select() if new_state else cb.deselect()
         self.update_btn_text()
 
     def update_btn_text(self):
-        self.proc_btn.configure(state="normal" if self.danger_files else "disabled")
+        self._remember_selection()
+        enabled = any(f.get('can_quarantine') and self._selection.get(f['item_id'], False)
+                      for f in self.danger_files)
+        self.proc_btn.configure(state="normal" if enabled and not self.scanning else "disabled")
 
     def process_selected(self):
-        count = 0; remaining = []
-        for i, cb in enumerate(self.file_checkbuttons):
-            if cb.get():
-                if quarantine(self.danger_files[i]['path']): count += 1
-                else: remaining.append(self.danger_files[i])
-        self.danger_files = remaining
+        if self.scanning or self._closing:
+            return
+        self._remember_selection()
+        removed = set()
+        for item in self.danger_files:
+            item_id = item['item_id']
+            if not item.get('can_quarantine') or not self._selection.get(item_id, False):
+                continue
+            try:
+                expected_hash = item.get('sha256')
+                if not expected_hash:
+                    raise ValueError("缺少扫描时的文件摘要，请重新扫描后再隔离")
+                result = quarantine(item['path'], expected_sha256=expected_hash)
+            except Exception as exc:
+                result = {'status': 'failed', 'error': str(exc)}
+            item['quarantine_result'] = dict(result)
+            item['remediation_state'] = result['status']
+            item['error'] = result.get('error') or ''
+            archive = result.get('archive_path') or '无已发布归档'
+            if result['status'] == 'isolated':
+                removed.add(item_id)
+                self.scan_log_box.insert("end", f"已隔离 {item['path']} -> {archive}\n")
+                if item['error']:
+                    self.scan_log_box.insert("end", f"隔离清理提示: {item['error']}\n")
+            else:
+                state = '已保存副本，但原文件未确认移除' if result['status'] == 'copied_not_removed' else '隔离失败，未确认移除原文件'
+                self.scan_log_box.insert("end", f"{state} {item['path']} -> {archive}: {item['error']}\n")
+        # Keep unchecked, failed and not-yet-rendered items; never rebuild by checkbox index.
+        self.danger_files = [f for f in self.danger_files if f['item_id'] not in removed]
+        for item_id in removed:
+            self._selection.pop(item_id, None)
         self.refresh_list()
-        if count: scan_log(f"已隔离 {count} 个文件")
+        if removed:
+            self.scan_log_box.insert("end", f"已隔离 {len(removed)} 个文件\n")
+
+    @staticmethod
+    def _result_text(item):
+        label = os.path.basename(item.get('path') or '') or item.get('engine', '扫描结果')
+        detail = ' '.join(str(part) for part in (item.get('type'), item.get('error')) if part)
+        remediation = {'copied_not_removed': '仅保存副本，原文件未确认移除',
+                       'failed': '隔离失败', 'isolated': '已隔离'}.get(item.get('remediation_state'), '')
+        return f"{label} [{item['status']}] {remediation} {detail} 恶意({item.get('malicious', '-')})"
 
     def refresh_list(self):
-        for widget in self.file_scroll_frame.winfo_children(): widget.destroy()
+        self._remember_selection()
+        self._cancel_render()
+        for widget in self.file_scroll_frame.winfo_children():
+            widget.destroy()
         self.file_checkbuttons.clear()
-        self._remaining_to_add = list(enumerate(self.danger_files))
-        self.after(10, self._add_batch)
+        self._checkboxes.clear()
+        self._remaining_to_add = deque(dict(f) for f in self.danger_files)
+        self._render_timer = self.after(10, lambda g=self._render_generation: self._add_batch(g))
 
-    def _add_batch(self):
-        batch_size = 20
-        for _ in range(batch_size):
+    def _add_batch(self, generation):
+        if self._closing or generation != self._render_generation:
+            return
+        self._render_timer = None
+        for _ in range(20):
             if not self._remaining_to_add:
-                self.update_btn_text()
-                threading.Thread(target=self._update_signatures, daemon=True).start()
-                return
-            i, f = self._remaining_to_add.pop(0)
-            cb = ctk.CTkCheckBox(self.file_scroll_frame, text=f"扫描 {os.path.basename(f['path'])} ...")
+                break
+            item = self._remaining_to_add.popleft()
+            item_id = item['item_id']
+            cb = ctk.CTkCheckBox(self.file_scroll_frame, text=self._result_text(item),
+                               command=self.update_btn_text)
             cb.pack(anchor="w", padx=5)
-            cb.select()
-            cb.configure(command=self.update_btn_text)
+            if item.get('can_quarantine'):
+                if self._selection.setdefault(item_id, True):
+                    cb.select()
+            else:
+                self._selection[item_id] = False
+                cb.configure(state="disabled")
             self.file_checkbuttons.append(cb)
+            self._checkboxes[item_id] = cb
+        self.update_btn_text()
         if self._remaining_to_add:
-            self.after(10, self._add_batch)
-        else:
-            self.update_btn_text()
-            threading.Thread(target=self._update_signatures, daemon=True).start()
+            self._render_timer = self.after(10, lambda: self._add_batch(generation))
+        elif self.sig_var.get():
+            # Capture IDs, paths and option on the UI thread, not in the worker.
+            snapshot = tuple((f['item_id'], f.get('path'), self._result_text(f))
+                             for f in self.danger_files if f.get('can_quarantine'))
+            self._signature_cancel = threading.Event()
+            self._start_scan_worker(self._update_signatures, self._scan_id, generation,
+                                    snapshot, self._signature_cancel)
 
-    def _update_signatures(self):
+    def _update_signatures(self, scan_id, generation, snapshot, cancel):
         updates = []
-        for i, f in enumerate(self.danger_files):
-            sig = ""
-            if self.sig_var.get():
-                if not check_digital_signature(f['path']): sig = "无签名，"
-            text = f"{os.path.basename(f['path'])} {sig}{f.get('type','')} 恶意({f.get('malicious',0)})"
-            updates.append((i, text))
-        def apply():
-            for idx, text in updates:
-                if idx < len(self.file_checkbuttons): self.file_checkbuttons[idx].configure(text=text)
-        try:
-            self.after(0, apply)
-        except RuntimeError:
-            pass
+        for item_id, path, text in snapshot:
+            if cancel.is_set() or self._closing:
+                return
+            valid = check_digital_signature(path)
+            updates.append((item_id, text + (" 签名有效" if valid else " 签名无效或无法验证")))
+        self._post_scan_event(scan_id, "signatures", (generation, updates), cancel)
 
     def start_scan_thread(self):
-        if self.scanning:
-            messagebox.showinfo("提示", "已有扫描任务正在运行"); return
-        self.scanning = True; self.exec_btn.configure(state="disabled")
+        if self.scanning or self._closing:
+            messagebox.showinfo("提示", "已有扫描任务正在运行或程序正在关闭")
+            return
         mode = self.scan_mode.get()
-        if mode == "单文件查杀":
-            if not self.config['virustotal']:
-                messagebox.showinfo("提示", "请开启virustotal云查杀引擎"); self.scanning = False; self.exec_btn.configure(state="normal"); return
-            target = filedialog.askopenfilename()
-            if not target: self.scanning = False; self.exec_btn.configure(state="normal"); return
-            self.prepare_scan_ui()
-            threading.Thread(target=lambda: self._safe_scan(self.single_file_scan, target), daemon=True).start()
-        elif mode == "文件夹查杀":
-            if not self.config['virustotal']:
-                messagebox.showinfo("提示", "请开启virustotal云查杀引擎"); self.scanning = False; self.exec_btn.configure(state="normal"); return
-            target = filedialog.askdirectory()
-            if not target: self.scanning = False; self.exec_btn.configure(state="normal"); return
-            self.prepare_scan_ui()
-            threading.Thread(target=lambda: self._safe_scan(self.folder_scan, target), daemon=True).start()
+        target = None
+        allow_upload = False
+        if mode in ("单文件查杀", "文件夹查杀"):
+            if not self.config.get('virustotal'):
+                messagebox.showinfo("提示", "请开启virustotal云查杀引擎")
+                return
+            if not self.config.get('apikey', '').strip():
+                messagebox.showerror("提示", "API Key为空")
+                return
+            target = filedialog.askopenfilename() if mode == "单文件查杀" else filedialog.askdirectory()
+            if not target:
+                return
+            allow_upload = messagebox.askyesno(
+                "本次任务的文件上传授权",
+                f"默认仅向VirusTotal发送文件SHA256进行查询。\n目标: {target}\n\n"
+                "是否允许本次任务将未收录且不超过30MB的文件完整上传？"
+                "文件夹模式包含其子目录。文件内容可能与第三方安全研究人员共享，"
+                "请勿上传敏感文件。选择‘否’仍会进行哈希查询。",
+                default="no")
+            scan_func = self.single_file_scan if mode == "单文件查杀" else self.folder_scan
         else:
-            self.prepare_scan_ui()
-            threading.Thread(target=lambda: self._safe_scan(self.full_scan), daemon=True).start()
-
-    def _safe_scan(self, scan_func, *args):
-        try: scan_func(*args)
-        except Exception as e: scan_log(f"扫描过程发生错误: {e}")
-        finally:
-            self.scanning = False
-            try:
-                self.after(0, lambda: self.exec_btn.configure(state="normal"))
-            except RuntimeError:
-                pass
-
-    def single_file_scan(self, target):
-        api_key = self.config.get('apikey','').strip()
-        if not api_key:
-            scan_log("API Key为空")
-            update_progress(0, "扫描已终止")
-            return
-        global API_KEY
-        API_KEY = api_key
-        self.danger_files = []
-        update_progress(0, "准备扫描...")
-        scan_log("="*50)
-        scan_log(f"开始单文件扫描: {target}")
-        if not os.path.exists(target):
-            scan_log("文件不存在")
-            update_progress(0, "扫描已终止")
-            return
-
-        size = os.path.getsize(target)
-        update_progress(10, "计算哈希...")
-        whitelist = load_whitelist()
-        whitelist_hashes = {item['hash'] for item in whitelist if item.get('hash')}
-        h = get_file_hash(target)
-        if not h:
-            scan_log("无法计算哈希")
-            update_progress(0, "扫描已终止")
-            return
-        if h in whitelist_hashes:
-            scan_log("文件在白名单中")
-            update_progress(100, "扫描完成")
-            return
-
-        update_progress(30, "查询VT...")
-        url = f"{BASE_URL}/files/{h}"
-        headers = {"x-apikey": api_key}
+            scan_func = self.full_scan
+        self._scan_cancel.set()
+        self._scan_id += 1
+        self._scan_cancel = threading.Event()
+        task = MappingProxyType({'scan_id': self._scan_id, 'cancel': self._scan_cancel,
+                                 'allow_upload': bool(allow_upload),
+                                 'config': MappingProxyType(dict(self.config))})
+        self.prepare_scan_ui()
+        self.scanning = True
+        self.exec_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
         try:
-            r = requests.get(url, headers=headers, timeout=30)
-            if r.status_code == 404:
-                scan_log("文件未被收录")
-                if size > MAX_UPLOAD_SIZE:
-                    scan_log(f"文件超过30MB ({size//(1024*1024)}MB)，仅使用SHA256查询VT，不上传文件")
-                    update_progress(100, "扫描完成")
-                    return
-                scan_log("正在上传到 VT 分析...")
-                update_progress(50, "上传文件中...")
-                upload_url = "https://www.virustotal.com/api/v3/files"
-                with open(target, 'rb') as f:
-                    files = {'file': (os.path.basename(target), f)}
-                    upload_r = requests.post(upload_url, headers={"x-apikey": api_key}, files=files, timeout=60)
-                if upload_r.status_code == 200:
-                    upload_data = upload_r.json()
-                    analysis_id = upload_data.get('data', {}).get('id', '')
-                    scan_log(f"文件已上传，分析ID: {analysis_id}")
-                    scan_log("等待分析完成...")
-                    update_progress(70, "等待VT分析...")
-                    analysis_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
-                    analysis_completed = False
-                    for _ in range(20):
-                        time.sleep(5)
-                        analysis_r = requests.get(analysis_url, headers={"x-apikey": api_key}, timeout=30)
-                        if analysis_r.status_code == 200:
-                            analysis_data = analysis_r.json()
-                            status = analysis_data.get('data', {}).get('attributes', {}).get('status', '')
-                            if status == 'completed':
-                                stats = analysis_data.get('data', {}).get('attributes', {}).get('stats', {})
-                                malicious = stats.get('malicious', 0)
-                                suspicious = stats.get('suspicious', 0)
-                                if self.config.get('sensitive'):
-                                    if malicious >= 1:
-                                        self.danger_files.append({'path':target, 'type':"恶意(上传分析)", 'malicious':malicious, 'suspicious':suspicious, 'mode':'single'})
-                                else:
-                                    if malicious >= 6:
-                                        self.danger_files.append({'path':target, 'type':"恶意(上传分析)", 'malicious':malicious, 'suspicious':suspicious, 'mode':'single'})
-                                scan_log(f"分析完成 - 恶意:{malicious}, 可疑:{suspicious}")
-                                analysis_completed = True
-                                break
-                        time.sleep(5)
-                    if not analysis_completed:
-                        scan_log("VT 分析超时，未能在限定时间内获取结果")
+            self._start_scan_worker(self._safe_scan, scan_func, target, task)
+        except Exception as exc:
+            self._finish_scan({'results': [], 'status': 'failed', 'message': f"无法启动扫描: {exc}"})
+
+    def cancel_scan(self):
+        if self.scanning:
+            self._scan_cancel.set()
+            self.cancel_btn.configure(state="disabled")
+            self._set_progress(0, "正在取消；等待当前请求返回，不会继续上传或查询")
+
+    def _safe_scan(self, scan_func, target, task):
+        try:
+            outcome = scan_func(target, task)
+        except Exception as exc:
+            outcome = {'results': [], 'status': 'failed', 'message': f"扫描失败: {exc}"}
+        if task['cancel'].is_set():
+            message = outcome.get('message', '')
+            outcome = dict(outcome, status='cancelled', message=(message + " 扫描已取消；保留已取得结果，未检查部分不代表安全").strip())
+        self._post_scan_event(task['scan_id'], "done", outcome)
+
+    def _finish_scan(self, outcome):
+        self.scanning = False
+        self.exec_btn.configure(state="normal")
+        self.cancel_btn.configure(state="disabled")
+        self.scan_results = outcome['results']
+        self.danger_files = [f for f in self.scan_results
+                             if f['verdict'] not in ('not_flagged', 'whitelisted')]
+        unresolved = sum(f['status'] != 'completed' for f in self.scan_results)
+        malicious = sum(f['verdict'] == 'malicious' for f in self.scan_results)
+        message = outcome.get('message') or f"任务结束：危险 {malicious} 项，未判定/失败 {unresolved} 项（不代表其余文件绝对安全）"
+        self.scan_log_box.insert("end", message + "\n")
+        self._set_progress(100 if outcome['status'] == 'completed' else 0, message)
+        self.refresh_list()
+
+    @staticmethod
+    def _scan_result(task, path, status='unknown', verdict='unknown', engine='VirusTotal', **extra):
+        return dict(scan_id=task['scan_id'], item_id=uuid4().hex, path=path,
+                    status=status, verdict=verdict, engine=engine, error='',
+                    remediation_state='not_attempted', can_quarantine=False, **extra)
+
+    def _scan_vt_file(self, path, task, whitelist_hashes, poll_attempts):
+        result = self._scan_result(task, path)
+        cancel = task['cancel']
+        if cancel.is_set():
+            result['status'] = 'cancelled'
+            return result
+        try:
+            api_key = task['config'].get('apikey', '').strip()
+            if not api_key:
+                raise ValueError("API Key为空")
+            if not os.path.isfile(path):
+                raise ValueError("文件不存在或不是普通文件")
+            h = get_file_hash(path)
+            result['sha256'] = h
+            if not h:
+                raise ValueError("无法计算SHA256，文件尚未判定")
+            if h in whitelist_hashes:
+                result.update(status='completed', verdict='whitelisted', type='白名单跳过（未经扫描）')
+                return result
+            headers = {"x-apikey": api_key}
+            if cancel.is_set():
+                result['status'] = 'cancelled'
+                return result
+            response = requests.get(f"{BASE_URL}/files/{h}", headers=headers, timeout=30)
+            uploaded = False
+            if cancel.is_set():
+                result['status'] = 'cancelled'
+                return result
+            if response.status_code == 404:
+                if not task['allow_upload']:
+                    result['error'] = "VT未收录；未授权上传，仅查询哈希，未判定"
+                    return result
+                if os.path.getsize(path) > MAX_UPLOAD_SIZE:
+                    result['error'] = "VT未收录且文件超过30MB；不上传，未判定"
+                    return result
+                # Consent is task-local. Check cancellation immediately before any POST.
+                with open(path, 'rb') as file:
+                    if os.fstat(file.fileno()).st_size > MAX_UPLOAD_SIZE:
+                        result['error'] = "文件已增大至超过30MB；不上传，未判定"
+                        return result
+                    if cancel.is_set():
+                        result['status'] = 'cancelled'
+                        return result
+                    response = requests.post(f"{BASE_URL}/files", headers=headers,
+                                             files={'file': (os.path.basename(path), file)}, timeout=60)
+                if response.status_code != 200:
+                    raise ValueError(f"VT上传失败 HTTP {response.status_code}")
+                analysis_id = response.json().get('data', {}).get('id')
+                if not isinstance(analysis_id, str) or not analysis_id:
+                    raise ValueError("VT未返回有效分析ID")
+                uploaded = True
+                for _ in range(poll_attempts):
+                    if cancel.wait(5):
+                        result['status'] = 'cancelled'
+                        return result
+                    response = requests.get(f"{BASE_URL}/analyses/{analysis_id}", headers=headers, timeout=30)
+                    if response.status_code != 200:
+                        raise ValueError(f"VT分析查询失败 HTTP {response.status_code}")
+                    attributes = response.json().get('data', {}).get('attributes', {})
+                    if attributes.get('status') == 'completed':
+                        stats = attributes.get('stats')
+                        break
                 else:
-                    scan_log(f"上传失败 HTTP {upload_r.status_code}")
-                update_progress(100, "扫描完成")
-                return
-            if r.status_code != 200:
-                scan_log(f"VT异常 HTTP {r.status_code}")
-                update_progress(100, "扫描完成")
-                return
-            data = r.json()
-            stats = data.get("data",{}).get("attributes",{}).get("last_analysis_stats",{})
-            malicious = stats.get("malicious",0)
-            suspicious = stats.get("suspicious",0)
-            if self.config.get('sensitive'):
-                if malicious >= 1:
-                    self.danger_files.append({'path':target, 'type':"恶意", 'malicious':malicious, 'suspicious':suspicious, 'mode':'single'})
+                    result.update(status='pending', error='VT分析尚未完成，等待超时；未判定')
+                    return result
+            elif response.status_code == 200:
+                stats = response.json().get('data', {}).get('attributes', {}).get('last_analysis_stats')
             else:
-                if malicious >= 6:
-                    self.danger_files.append({'path':target, 'type':"恶意", 'malicious':malicious, 'suspicious':suspicious, 'mode':'single'})
-        except Exception as e:
-            scan_log(f"请求失败: {e}")
-        update_progress(100, "扫描完成")
-        scan_log(f"发现 {len(self.danger_files)} 个危险项")
-        self.after(0, self.refresh_list)
+                raise ValueError(f"VT查询失败 HTTP {response.status_code}")
+            if cancel.is_set():
+                result['status'] = 'cancelled'
+                return result
+            if (not isinstance(stats, dict) or 'malicious' not in stats or 'suspicious' not in stats
+                    or any(type(v) is not int or v < 0 for v in stats.values())):
+                raise ValueError("VT统计数据缺失或格式无效，未判定")
+            if sum(stats.get(k, 0) for k in ('malicious', 'suspicious', 'harmless', 'undetected')) == 0:
+                result['error'] = "VT未提供有效引擎判定，不能视为安全"
+                return result
+            malicious, suspicious = stats['malicious'], stats['suspicious']
+            threshold = 1 if task['config'].get('sensitive') else 6
+            flagged = malicious >= threshold
+            result.update(status='completed', verdict='malicious' if flagged else 'not_flagged',
+                          malicious=malicious, suspicious=suspicious, can_quarantine=flagged,
+                          type=('恶意' if flagged else '未达到报警阈值') + ('(上传分析)' if uploaded else ''))
+        except Exception as exc:
+            result.update(status='failed', error=str(exc))
+        return result
 
-    def full_scan(self):
-        self.danger_files = []
-        scan_log("="*50)
-        scan_log("全盘查杀 (Windows Defender)")
-        update_progress(0, "初始化...")
-
-        defender = DefenderScanner(
-            offline_only=self.config.get('windows_defender_offline_only', True),
-            force_use=self.config.get('windows_defender_force', False)
-        )
-
-        if not defender.available:
-            scan_log("Defender 不可用")
-            self.after(0, lambda: messagebox.showerror("错误", "Defender 不可用"))
-            return
-
-        update_progress(10, "全盘扫描中，请耐心等待...")
-        scan_log("全盘扫描中，这可能需要较长时间...")
-
-        threats = defender.full_scan()
-
-        self.danger_files = [
-            {
-                'path': t.get('path', '未知'),
-                'type': f"Defender: {t.get('name', '未知威胁')}",
-                'malicious': 'Defender'
-            }
-            for t in threats
-        ]
-
-        update_progress(100, "扫描完成")
-        scan_log(f"发现 {len(self.danger_files)} 个威胁")
-        self.after(0, self.refresh_list)
-
-    def folder_scan(self, target):
-        """扫描指定文件夹下所有文件（复用单文件查杀逻辑）。"""
-        self.danger_files = []
-        scan_log("="*50)
-        scan_log(f"文件夹查杀: {target}")
-        update_progress(0, "准备扫描...")
-
-        if not os.path.isdir(target):
-            scan_log("目标不是有效文件夹")
-            update_progress(0, "扫描已终止")
-            return
-
-        # 收集所有文件
-        files = []
-        for root, dirs, fs_ in os.walk(target):
-            for name in fs_:
-                files.append(os.path.join(root, name))
-
-        total = len(files)
-        if total == 0:
-            scan_log("文件夹为空")
-            update_progress(100, "扫描完成")
-            self.after(0, self.refresh_list)
-            return
-
-        scan_log(f"共发现 {total} 个文件，开始逐个查杀...")
+    def single_file_scan(self, target, task):
         whitelist = load_whitelist()
-        whitelist_hashes = {item.get('hash') for item in whitelist if item.get('hash')}
-        api_key = self.config.get('apikey', '').strip()
-        sensitive = self.config.get('sensitive', False)
+        hashes = {item.get('hash') for item in whitelist if item.get('hash')}
+        result = self._scan_vt_file(target, task, hashes, 20)
+        return {'results': [result], 'status': result['status']}
 
-        for idx, fpath in enumerate(files, 1):
-            try:
-                prog = int(idx / total * 100)
-                update_progress(prog, f"扫描中 {idx}/{total}: {os.path.basename(fpath)}")
+    def full_scan(self, target, task):
+        scan_id = task['scan_id']
+        self._post_scan_event(scan_id, "progress", (10, "Defender全盘扫描中，请耐心等待"))
+        defender = DefenderScanner(
+            offline_only=task['config'].get('windows_defender_offline_only', True),
+            force_use=task['config'].get('windows_defender_force', False),
+            logger=lambda msg: self._post_scan_event(scan_id, "log", msg))
+        report = defender.full_scan(cancel_event=task['cancel'])
+        items = []
+        for threat in report['threats']:
+            item = self._scan_result(task, threat.get('path'), report['status'], 'unknown', 'Defender')
+            item.update(type=threat.get('name', 'Defender记录'), can_quarantine=False,
+                        remediation_state=threat.get('remediation_state', report['remediation_state']))
+            items.append(item)
+        message = report.get('message') or report.get('error') or '请到Windows安全中心确认扫描及处置结果'
+        if not items:
+            item = self._scan_result(task, None, report['status'], 'unknown', 'Defender')
+            item.update(type=message, error=report.get('error') or '',
+                        remediation_state=report['remediation_state'])
+            items.append(item)
+        return {'results': items, 'status': report['status'], 'message': message}
 
-                if not os.path.exists(fpath):
-                    continue
-                size = os.path.getsize(fpath)
-                h = get_file_hash(fpath)
-                if not h:
-                    continue
-                if h in whitelist_hashes:
-                    continue
-
-                # 查询 VT
-                url = f"{BASE_URL}/files/{h}"
-                headers = {"x-apikey": api_key}
-                try:
-                    r = requests.get(url, headers=headers, timeout=15)
-                    if r.status_code == 404:
-                        if size <= MAX_UPLOAD_SIZE and api_key:
-                            upload_r = requests.post(
-                                "https://www.virustotal.com/api/v3/files",
-                                headers={"x-apikey": api_key},
-                                files={'file': (os.path.basename(fpath), open(fpath, 'rb'))},
-                                timeout=30
-                            )
-                            if upload_r.status_code == 200:
-                                analysis_id = upload_r.json().get('data', {}).get('id', '')
-                                analyzed = False
-                                for _ in range(6):
-                                    time.sleep(5)
-                                    ar = requests.get(
-                                        f"{BASE_URL}/analyses/{analysis_id}",
-                                        headers=headers, timeout=15
-                                    )
-                                    if ar.status_code == 200:
-                                        status = ar.json().get('data', {}).get('attributes', {}).get('status', '')
-                                        if status == 'completed':
-                                            stats = ar.json().get('data', {}).get('attributes', {}).get('stats', {})
-                                            malicious = stats.get('malicious', 0)
-                                            threshold = 1 if sensitive else 6
-                                            if malicious >= threshold:
-                                                self.danger_files.append({
-                                                    'path': fpath,
-                                                    'type': f"恶意(文件夹查杀)",
-                                                    'malicious': malicious,
-                                                    'suspicious': stats.get('suspicious', 0),
-                                                    'mode': 'folder'
-                                                })
-                                            analyzed = True
-                                            break
-                                if not analyzed:
-                                    scan_log(f"VT 分析超时: {os.path.basename(fpath)}")
-                        continue
-                    if r.status_code == 200:
-                        data = r.json()
-                        stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
-                        malicious = stats.get("malicious", 0)
-                        threshold = 1 if sensitive else 6
-                        if malicious >= threshold:
-                            self.danger_files.append({
-                                'path': fpath,
-                                'type': "恶意",
-                                'malicious': malicious,
-                                'suspicious': stats.get('suspicious', 0),
-                                'mode': 'folder'
-                            })
-                except Exception as e:
-                    scan_log(f"查询 VT 出错 {os.path.basename(fpath)}: {e}")
-            except Exception as e:
-                scan_log(f"处理文件出错 {os.path.basename(fpath)}: {e}")
-
-        update_progress(100, "扫描完成")
-        scan_log(f"文件夹查杀完成，发现 {len(self.danger_files)} 个危险项")
-        self.after(0, self.refresh_list)
+    def folder_scan(self, target, task):
+        if not os.path.isdir(target):
+            return {'results': [], 'status': 'failed', 'message': '目标不是有效文件夹'}
+        files, walk_errors = [], []
+        for root, dirs, names in os.walk(target, onerror=lambda exc: walk_errors.append(str(exc))):
+            if task['cancel'].is_set():
+                return {'results': [], 'status': 'cancelled'}
+            files.extend(os.path.join(root, name) for name in names)
+        whitelist = load_whitelist()
+        hashes = {item.get('hash') for item in whitelist if item.get('hash')}
+        results = []
+        for idx, path in enumerate(files, 1):
+            if task['cancel'].is_set():
+                break
+            self._post_scan_event(task['scan_id'], "progress", (int(idx / len(files) * 100),
+                                  f"扫描中 {idx}/{len(files)}: {os.path.basename(path)}"))
+            results.append(self._scan_vt_file(path, task, hashes, 6))
+        status = 'completed' if all(r['status'] == 'completed' for r in results) else 'partial'
+        message = ''
+        if walk_errors:
+            status = 'partial'
+            message = '扫描不完整，部分目录无法读取：' + '; '.join(walk_errors)
+        if task['cancel'].is_set():
+            status = 'cancelled'
+        return {'results': results, 'status': status, 'message': message}
 
     def destroy(self):
-        try:
-            self._cleanup_all_rick_popups()
-        except: pass
-        try:
-            if self.ad_check_timer: self.after_cancel(self.ad_check_timer)
-        except: pass
-        try:
-            if self.suspended_timer_id: self.after_cancel(self.suspended_timer_id)
-        except: pass
-        try:
-            if self.ad and self.ad.running:
-                threading.Thread(target=self.ad.stop, daemon=True).start()
-        except: pass
+        if self._closing:
+            return
+        self._closing = True
+        self._shutdown_during_scan = self.scanning
+        self._scan_cancel.set()
+        self._signature_cancel.set()
+        self._cancel_render()
+        self.exec_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="disabled")
+        self.proc_btn.configure(state="disabled")
+        self._cleanup_all_rick_popups()
+        for timer in (getattr(self, 'ad_check_timer', None),
+                      getattr(self, 'suspended_timer_id', None), self._scan_ui_timer):
+            if timer is not None:
+                self.after_cancel(timer)
+        if self.ad and self.ad.running:
+            # Active-defense lifecycle is a separate repair batch; do not enable it here.
+            threading.Thread(target=self.ad.stop, daemon=True).start()
+        self._wait_for_scan_workers(time.monotonic() + 5)
+
+    def _wait_for_scan_workers(self, deadline):
+        alive = [worker for worker in self._scan_workers if worker.is_alive()]
+        if alive and time.monotonic() < deadline:
+            self._set_progress(0, "正在关闭，等待扫描工作线程退出...")
+            self.after(50, lambda: self._wait_for_scan_workers(deadline))
+            return
+        # A requests call cannot be force-cancelled safely. Late workers cannot touch Tk.
+        if alive or self._shutdown_during_scan:
+            messagebox.showwarning(
+                "关闭时的扫描状态",
+                "已请求取消扫描，但关闭窗口不代表所有请求或处置都已完成。"
+                "若使用了Defender，结束MpCmdRun客户端也不代表服务扫描停止，"
+                "请到Windows安全中心确认检测与处置状态。"
+                + (" 仍有后台请求尚未返回。" if alive else ""))
+        if getattr(sys, 'app', None) is self:
+            sys.app = None
         super().destroy()

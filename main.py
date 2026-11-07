@@ -1,9 +1,11 @@
 import os
 import sys
 import traceback
+import subprocess
 from datetime import datetime
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+ENTRY_SCRIPT = os.path.abspath(__file__)
+PROJECT_ROOT = os.path.dirname(ENTRY_SCRIPT)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -47,26 +49,24 @@ def is_admin():
 
 
 def elevate_if_needed():
-    if getattr(sys, 'frozen', False) and sys.argv and sys.argv[0].endswith('.py'):
-        return
     if is_admin():
         return
-    
-    # 增加非交互式检测
-    if not hasattr(sys, 'stdin') or sys.stdin is None or not sys.stdin.isatty():
-        print("未检测到交互式环境，无法自动提权。请尝试以管理员身份手动运行。")
-        return
 
+    # UAC does not require a console; pythonw and packaged GUI launches have no stdin.
     import ctypes
     try:
-        script = os.path.abspath(sys.argv[0])
-        params = ' '.join([f'"{arg}"' for arg in sys.argv[1:]])
+        args = list(sys.argv[1:])
+        if not getattr(sys, 'frozen', False):
+            args.insert(0, ENTRY_SCRIPT)
+        params = subprocess.list2cmdline(args)
         ret = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, f'"{script}" {params}', None, 1)
+            None, "runas", sys.executable, params, PROJECT_ROOT, 1)
         if ret <= 32:
-            print(f"提权失败 (Error: {ret})")
+            print(f"提权失败或已取消 (Error: {ret})")
+            sys.exit(1)
     except Exception as e:
         print(f"提权调用异常: {e}")
+        sys.exit(1)
     sys.exit(0)
 
 
