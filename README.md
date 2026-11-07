@@ -85,9 +85,42 @@ Run python main.py to launch the graphical interface:
 6. Whitelist: View and manage allowed processes
 
 #### Command-Line Usage
-- python main.py - Launch GUI
-- Configure via utils/config.txt or GUI settings
-- Active defense can be enabled/disabled in settings
+
+The GUI still starts with `python main.py`; active defense is controlled in its settings. For AI or subprocess automation, use the separate [CLI entry point](<cli.py>) with [read-only diagnostics](<core/diagnostics.py>). Phase one implements only `capabilities` and `doctor`, using the Python standard library; GUI dependencies and administrator privileges are not required for these commands.
+
+Run from the project root:
+
+~~~text
+python -B cli.py --help
+python -B cli.py capabilities --json
+python -B cli.py doctor --json
+python -B cli.py capabilities --jsonl
+~~~
+
+- `capabilities` lists implemented commands, output formats, exit codes, and limitations. It does not claim that planned scanning or testing interfaces exist.
+- `doctor` checks Python/platform information, current administrator status, dependency discoverability, and the Defender executable at the location used by the existing scanner. It does not launch the GUI, request elevation, start scans, access network services, read configuration or credentials, install dependencies, or create application directories.
+- Dependency discovery inspects only verified-local Windows directories without importing dependencies or invoking custom import hooks. Network paths, reparse paths, archives, and unverifiable locations are skipped. Windows-only checks return `unsupported` or `unchecked` on other platforms.
+
+**Output contract**
+
+- The default output and `--json` produce one final JSON object. `--jsonl` produces JSON events; phase one emits only the final event with `"event":"result"`. The two flags are mutually exclusive.
+- Responses contain `schema_version` (currently `"1.0"`), `request_id`, `command`, `status`, `result`, and `errors`. Each error includes `code`, `message`, and `next_action`. Parse the structured fields rather than matching human-readable messages.
+- Plain `--help` prints text; adding `--json` or `--jsonl` wraps help in the corresponding response format. Machine output is not mixed with human logs.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Command completed; inspect diagnostic findings, not just the exit code |
+| 2 | Missing, unknown, or conflicting arguments |
+| 3 | Requested capability or required CLI module unavailable |
+| 5 | Execution or output failure |
+| 130 | Cancelled by interruption |
+| 4 / 6 / 124 | Reserved for authorization failure / partial or unconfirmed execution / timeout; not implemented in phase one |
+
+**Interpretation and limits**
+
+`discoverable` means a dependency candidate was found, not that it imports or works correctly. `present` means the Defender executable exists, not that its service is ready. Missing or unverified observations are reported as `unavailable`, `unchecked`, or `unsupported`. An optional dependency finding does not itself make `doctor` fail; exit `0` and `status=completed` do not certify engine health, file safety, or effective protection.
+
+Scanning, test execution, cleanup, and communication with a running GUI are not implemented. There is **no hard timeout** (`timeout_supported=false`); `124` is reserved, not an implemented timeout guarantee. Ctrl+C during diagnostics is handled as cancellation, but interruption during initialization or output may leave no complete JSON response. The broader [implementation plan](<plan.md>) describes future work, not currently available commands.
 
 #### Configuration
 Edit utils/config.txt or use the GUI:
@@ -218,9 +251,42 @@ VirusWise 是一个基于 Python 的主动防御安全平台，旨在实时检�
 6. 白名单: 查看和管理允许的进程
 
 #### 命令行使用
-- python main.py - 启动 GUI
-- 通过 utils/config.txt 或 GUI 设置进行配置
-- 主动防御可在设置中启用/禁用
+
+GUI 仍通过 `python main.py` 启动，主动防御在 GUI 设置中控制。AI 或子进程自动化请使用独立的 [CLI 入口](<cli.py>)及[只读诊断模块](<core/diagnostics.py>)。阶段一仅实现 `capabilities` 和 `doctor`，使用 Python 标准库；执行这些命令不要求安装 GUI 依赖或拥有管理员权限。
+
+在项目根目录运行：
+
+~~~text
+python -B cli.py --help
+python -B cli.py capabilities --json
+python -B cli.py doctor --json
+python -B cli.py capabilities --jsonl
+~~~
+
+- `capabilities`：列出已实现命令、输出格式、退出码和限制，不将计划中的扫描或测试接口标为可用。
+- `doctor`：检查 Python/系统信息、当前管理员状态、依赖可发现性，以及现有扫描器所用位置的 Defender 程序文件。不会启动 GUI、请求提权、执行扫描、访问网络服务、读取配置或密钥、安装依赖或创建业务目录。
+- 依赖检查仅查看已确认的 Windows 本地目录，不导入依赖模块、不调用自定义导入钩子；跳过网络路径、重解析路径、归档文件及无法确认的位置。在其他平台上，Windows 专属检查返回 `unsupported` 或 `unchecked`。
+
+**输出契约**
+
+- 默认输出及 `--json` 均为一个最终 JSON 对象。`--jsonl` 输出 JSON 事件，阶段一仅输出带 `"event":"result"` 的最终事件；两个选项互斥。
+- 响应固定包含 `schema_version`（当前为 `"1.0"`）、`request_id`、`command`、`status`、`result` 和 `errors`。每个错误包含 `code`、`message` 和 `next_action`；调用方应解析结构化字段，不匹配人类可读提示文本。
+- 单独使用 `--help` 输出文本；搭配 `--json` 或 `--jsonl` 则将帮助放入对应格式的响应中。机器输出不混入人类日志。
+
+| 退出码 | 含义 |
+| --- | --- |
+| 0 | 命令执行完成；仍须检查诊断结果，不能只看退出码 |
+| 2 | 参数缺失、未知或冲突 |
+| 3 | 请求的能力或 CLI 必需模块不可用 |
+| 5 | 执行或输出故障 |
+| 130 | 因中断而取消 |
+| 4 / 6 / 124 | 分别预留给授权不足、部分完成或待确认、超时；阶段一尚未实现 |
+
+**结果解释与限制**
+
+`discoverable` 仅表示发现了依赖候选，不证明它能导入或正常工作；`present` 仅表示 Defender 程序文件存在，不证明服务已就绪。缺失或无法确认的检查项返回 `unavailable`、`unchecked` 或 `unsupported`。可选依赖的诊断发现本身不会让 `doctor` 执行失败；退出码 `0` 和 `status=completed` 不代表引擎健康、文件安全或防护有效。
+
+扫描、测试执行、清理及与运行中 GUI 的通信均未实现。当前**没有硬超时**（`timeout_supported=false`），`124` 只是预留退出码，不是已实现的超时保证。诊断过程中的 Ctrl+C 会按取消处理，但初始化或输出期间中断可能无法得到完整 JSON 响应。[实施计划](<plan.md>)描述的是后续工作，不代表相关命令已经可用。
 
 #### 配置
 编辑 utils/config.txt 或使用 GUI:
