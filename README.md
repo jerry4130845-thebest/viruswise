@@ -37,7 +37,7 @@ VirusWise is a Python-based Active Defense security platform designed to detect,
    Note: Some UI components require customtkinter and PIL
 
 3. Configure the application:
-   - Edit utils/config.py or use the GUI settings page
+   - Use the GUI settings page; do not edit Python source to configure preferences
    - Set your VirusTotal API key (optional but recommended for cloud scanning)
    - Configure monitored directories in settings
 
@@ -45,18 +45,15 @@ VirusWise is a Python-based Active Defense security platform designed to detect,
    python main.py
 
 #### Running as Windows Service
-1. Install the service:
-   python main.py install
-   or use the built-in service command
+Service deployment/installation is a separate administrative step; the CLI only controls an already-installed `VirusWiseActiveDefense`. [main.py](<main.py>) is a GUI entry point, not an install/remove command. Do not use the old no-argument `net start` recipe: the updated service requires the controller’s baseline snapshot handoff. After deployment, use:
 
-2. Start the service:
-   net start VirusWiseActiveDefense
+~~~powershell
+python -B cli.py defense status --json
+python -B cli.py defense start --allow-system-effects --timeout 120 --json
+python -B cli.py defense stop --allow-system-effects --timeout 120 --json
+~~~
 
-3. Stop the service:
-   net stop VirusWiseActiveDefense
-
-4. Uninstall the service:
-   python main.py remove
+Run start and stop separately, only when intended. A missing service returns exit `3`; the CLI neither installs it nor elevates. SCM running state is not proof of protection readiness.
 
 ### Usage
 
@@ -139,6 +136,130 @@ python -B cli.py defense stop --allow-system-effects --timeout 120 --json
 | 6 | Partial or unconfirmed result, including unacknowledged service readiness |
 | 124 | Cooperative operation budget expired, not a hard I/O timeout guarantee |
 | 130 | Cancelled/interrupted |
+
+#### Calling VirusWise from a terminal or another program
+
+**Choose the entry point:** use [main.py](<main.py>) for the GUI (it may request UAC and initialize application data); use [cli.py](<cli.py>) for automation without GUI startup. Run commands from the project root after installing the dependencies above. A packaged GUI executable is not documented as a CLI executable; the examples here use the Python source entry point.
+
+**1. Windows PowerShell: launch, configure a session key, and capture the exit code**
+
+The VT command below performs a real network hash lookup, but does not authorize upload. Upload additionally requires `--allow-upload`. Keep the key out of shared terminal history/logs; remove it from the session when finished.
+
+~~~powershell
+# Replace this with your checkout path, then use its Python environment.
+Set-Location 'C:\path\to\viruswise'
+python -B main.py
+# The GUI command above blocks until the GUI exits; run CLI calls in another terminal.
+python -B cli.py doctor --json
+
+# Set only in this PowerShell session. Substitute your own key; do not commit it.
+$env:VIRUSWISE_VT_API_KEY = '<your-api-key>'
+python -B cli.py scan 'C:\Samples\sample.exe' --engine virustotal --allow-network --timeout 120 --json
+$scanExitCode = $LASTEXITCODE
+Write-Host "Scan exit code: $scanExitCode"
+Remove-Item Env:VIRUSWISE_VT_API_KEY
+~~~
+
+**2. Recommended integration: invoke the CLI as a subprocess**
+
+The following complete example runs the read-only `doctor` command. The commented replacement shows how to invoke a scan. Keep each argument separate and do not use `shell=True`; use an absolute checkout path so the caller can run from another working directory. If using a different Python environment, replace `sys.executable` with that interpreter’s absolute path.
+
+~~~python
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(r"C:\path\to\viruswise")  # Change to your checkout.
+# Use the interpreter/environment in which VirusWise dependencies are installed.
+args = [sys.executable, "-B", str(ROOT / "cli.py"), "doctor", "--json"]
+# To scan with explicit consent, replace the command tail after cli.py with:
+# ["scan", r"C:\Samples\sample.exe", "--engine", "virustotal",
+#  "--allow-network", "--timeout", "120", "--json"]
+# VIRUSWISE_VT_API_KEY is inherited from this process environment, not argv.
+try:
+    completed = subprocess.run(
+        args, cwd=str(ROOT), capture_output=True, text=True,
+        encoding="utf-8", errors="replace", check=False, timeout=180,
+    )
+except subprocess.TimeoutExpired:
+    raise RuntimeError("Caller wait expired; external effects may still be active")
+
+try:
+    response = json.loads(completed.stdout)
+except json.JSONDecodeError:
+    raise RuntimeError("No complete JSON response; inspect stderr locally")
+
+print("exit_code:", completed.returncode)
+print("status:", response["status"])
+print("result:", response["result"])
+print("errors:", response["errors"])
+# Nonzero responses can contain useful evidence; do not discard them via check=True.
+# Exit 0 is not a clean-file certificate; exit 6 / ready=False must not unlock tests.
+~~~
+
+The subprocess timeout above only bounds the caller’s wait and may terminate the CLI. It is separate from the CLI’s cooperative `--timeout` budget and cannot undo an upload, Defender remediation, saved whitelist, or SCM request. On a missing/truncated response, do not infer success.
+
+**3. Direct Python API: scan a file or directory**
+
+Run these snippets from the project root, or explicitly include that directory in your host process’s Python import path. This call performs a real lookup. Set `VIRUSWISE_VT_API_KEY` first; unlike the CLI wrapper, the scanner requires `api_key` to be passed explicitly.
+
+~~~python
+import os
+import threading
+from core.scanning import ScanError, scan_path
+
+cancel = threading.Event()
+try:
+    result = scan_path(
+        r"C:\Samples\sample.exe", engine="virustotal",
+        api_key=os.environ["VIRUSWISE_VT_API_KEY"],
+        allow_network=True, allow_upload=False, timeout=120,
+        cancel_event=cancel,
+    )
+except ScanError as exc:
+    print({"code": exc.code, "exit_code": exc.exit_code})
+else:
+    print(result["status"], result["verdict"])
+    for item in result["results"]:
+        print(item)
+# Another thread can call cancel.set(); cancellation is cooperative.
+# For Defender, replace the call arguments with:
+# scan_path(r"C:\Samples", engine="defender", allow_system_effects=True, timeout=120)
+~~~
+
+`scan_path()` returns a scan dictionary, **not** the CLI JSON envelope. Preflight failures raise `ScanError`; operational failures/partial results are normally returned through `status` and per-file results. A directory path scans recursively. Optional `on_event` receives scan dictionaries with `type` and `scan_id`; callbacks run synchronously and should not block or raise.
+
+**4. Direct Python API: query/start/stop installed active defense**
+
+The `start()` below is a real authorized operation: it can record/save the whitelist and request service startup. It enforces the hourly policy internally; callers do not need to record first. Keep the machine known-clean while recording. No service installation or automatic elevation is performed.
+
+~~~python
+from core.defense_control import start, status, stop
+
+print(status())  # Read-only query of the installed service and baseline metadata.
+result = start(allow_system_effects=True, timeout=120)
+print(result)
+if not result["ready"]:
+    print("Protection readiness is not confirmed; do not run dependent tests.")
+
+# Separate, deliberate stop operation; never implicit cleanup after an uncertain start:
+# result = stop(allow_system_effects=True, timeout=120)
+~~~
+
+These APIs return `{ok, ready, code, exit_code, ...}` dictionaries, not the CLI envelope. `status()` succeeding only confirms the query. All current results have `ready=False`; even SCM `RUNNING` after `start()` returns `readiness_unconfirmed` / exit code `6`. `start()` and `stop()` also accept `cancel_event` and `on_event`; service/recording events use `event` rather than the scanner’s `type` field. Do not confuse these callback formats.
+
+**5. Optional explicit whitelist recording**
+
+Only use this when you deliberately want to learn and persist a new baseline. It enumerates/hashes running executables for at least 30 seconds and writes whitelist/configuration data; it is not a read-only probe and does not start defense. Normally `start()` handles this automatically. GUI manual recording also handles pausing its own defense; a direct recorder call does not pause GUI/service enforcement for you.
+
+~~~python
+from core.whitelist_recording import record_whitelist
+
+result = record_whitelist(duration=30, timeout=120)
+print(result["ok"], result["code"])
+# ok=True means recording was committed, not that defense is ready.
+~~~
 
 #### Configuration
 Prefer the GUI for preferences. The [configuration loader](<utils/config.py>) resolves the data directory lazily. Boolean values in the text format are `1`/`0`; monitored paths are separated by `|`. CLI scans do not read this GUI API key. The final two fields below are maintained together by successful recording; leave them empty before the first recording, and do not fabricate or manually advance them. A missing or mismatched snapshot identity also requires re-recording.
@@ -226,7 +347,7 @@ VirusWise 是一个基于 Python 的主动防御安全平台，旨在实时检�
    注意: 部分 UI 组件需要 customtkinter 和 PIL
 
 3. 配置应用程序:
-   - 编辑 utils/config.py 或使用 GUI 设置页面
+   - 使用 GUI 设置页面配置偏好，不要通过修改 Python 源码配置程序
    - 设置你的 VirusTotal API key (可选，但强烈推荐用于云端扫描)
    - 在设置中配置监控目录
 
@@ -234,18 +355,15 @@ VirusWise 是一个基于 Python 的主动防御安全平台，旨在实时检�
    python main.py
 
 #### 作为 Windows 服务运行
-1. 安装服务:
-   python main.py install
-   或使用内置服务命令
+服务部署／安装属于单独的管理员操作；CLI 只控制已经安装的 `VirusWiseActiveDefense`。[main.py](<main.py>) 是 GUI 入口，不支持安装／卸载服务子命令。不要沿用旧的无参数 `net start` 示例：新版服务需要控制器传入白名单快照。完成服务部署后，分别按需调用：
 
-2. 启动服务:
-   net start VirusWiseActiveDefense
+~~~powershell
+python -B cli.py defense status --json
+python -B cli.py defense start --allow-system-effects --timeout 120 --json
+python -B cli.py defense stop --allow-system-effects --timeout 120 --json
+~~~
 
-3. 停止服务:
-   net stop VirusWiseActiveDefense
-
-4. 卸载服务:
-   python main.py remove
+不要把启动和停止当作一段必须连续执行的脚本。服务未安装时返回退出码 `3`，CLI 不会自动安装或提权。SCM 运行状态不代表防护已就绪。
 
 ### 使用方法
 
@@ -328,6 +446,130 @@ python -B cli.py defense stop --allow-system-effects --timeout 120 --json
 | 6 | 部分完成或结果未确认，包括未得到服务就绪确认 |
 | 124 | 协作式任务预算耗尽，不是硬 I/O 超时保证 |
 | 130 | 取消／中断 |
+
+#### 如何从终端或其他程序调用 VirusWise
+
+**先选入口：**人工操作使用 [main.py](<main.py>) 启动 GUI（可能弹出 UAC，并初始化应用数据）；脚本集成使用不启动 GUI 的 [cli.py](<cli.py>)。先按上面的安装步骤准备依赖，再在项目根目录执行命令。这里说明的是 Python 源码入口，不代表打包后的 GUI 可执行文件也支持这些 CLI 参数。
+
+**1. Windows PowerShell：启动程序、设置临时密钥、获取退出码**
+
+将下面项目路径和密钥占位符替换为自己的值。GUI 命令会阻塞终端直到窗口退出，可在另一个终端运行 CLI。扫描命令会实际联网查询哈希，但不允许上传；上传还需显式增加 `--allow-upload`。密钥只设置在当前 PowerShell 会话中，不要提交到仓库或写入共享终端历史／日志。
+
+~~~powershell
+# Replace this with your checkout path, then use its Python environment.
+Set-Location 'C:\path\to\viruswise'
+python -B main.py
+# The GUI command above blocks until the GUI exits; run CLI calls in another terminal.
+python -B cli.py doctor --json
+
+# Set only in this PowerShell session. Substitute your own key; do not commit it.
+$env:VIRUSWISE_VT_API_KEY = '<your-api-key>'
+python -B cli.py scan 'C:\Samples\sample.exe' --engine virustotal --allow-network --timeout 120 --json
+$scanExitCode = $LASTEXITCODE
+Write-Host "Scan exit code: $scanExitCode"
+Remove-Item Env:VIRUSWISE_VT_API_KEY
+~~~
+
+**2. 推荐集成方式：其他 Python 程序通过子进程调用 CLI**
+
+下面是完整的只读 `doctor` 调用示例；注释给出了改成扫描命令时的参数。每个参数单独放在列表里，不使用 `shell=True`。项目路径使用绝对路径，调用方不必位于项目目录。`sys.executable` 必须对应已经安装 VirusWise 依赖的 Python 环境；否则换成该解释器的绝对路径。VT 密钥由父进程环境继承，不放进命令行参数。
+
+~~~python
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(r"C:\path\to\viruswise")  # Change to your checkout.
+# Use the interpreter/environment in which VirusWise dependencies are installed.
+args = [sys.executable, "-B", str(ROOT / "cli.py"), "doctor", "--json"]
+# To scan with explicit consent, replace the command tail after cli.py with:
+# ["scan", r"C:\Samples\sample.exe", "--engine", "virustotal",
+#  "--allow-network", "--timeout", "120", "--json"]
+# VIRUSWISE_VT_API_KEY is inherited from this process environment, not argv.
+try:
+    completed = subprocess.run(
+        args, cwd=str(ROOT), capture_output=True, text=True,
+        encoding="utf-8", errors="replace", check=False, timeout=180,
+    )
+except subprocess.TimeoutExpired:
+    raise RuntimeError("Caller wait expired; external effects may still be active")
+
+try:
+    response = json.loads(completed.stdout)
+except json.JSONDecodeError:
+    raise RuntimeError("No complete JSON response; inspect stderr locally")
+
+print("exit_code:", completed.returncode)
+print("status:", response["status"])
+print("result:", response["result"])
+print("errors:", response["errors"])
+# Nonzero responses can contain useful evidence; do not discard them via check=True.
+# Exit 0 is not a clean-file certificate; exit 6 / ready=False must not unlock tests.
+~~~
+
+上面的子进程 `timeout=180` 是调用方等待上限，可能终止 CLI；它不同于 CLI 的协作式 `--timeout 120`，也不能撤销上传、Defender 处置、已保存白名单或已发出的 SCM 请求。非零退出码仍可能包含有用结果，所以使用 `check=False` 并解析返回 JSON；响应缺失或截断时不能当作成功。
+
+**3. 直接导入 Python API：扫描文件或文件夹**
+
+从项目根目录运行以下代码，或明确把项目根目录加入宿主程序的 Python 导入路径。此示例会实际联网查询。先设置 `VIRUSWISE_VT_API_KEY`；与 CLI 包装层不同，直接调用扫描器必须通过 `api_key` 参数传入密钥。
+
+~~~python
+import os
+import threading
+from core.scanning import ScanError, scan_path
+
+cancel = threading.Event()
+try:
+    result = scan_path(
+        r"C:\Samples\sample.exe", engine="virustotal",
+        api_key=os.environ["VIRUSWISE_VT_API_KEY"],
+        allow_network=True, allow_upload=False, timeout=120,
+        cancel_event=cancel,
+    )
+except ScanError as exc:
+    print({"code": exc.code, "exit_code": exc.exit_code})
+else:
+    print(result["status"], result["verdict"])
+    for item in result["results"]:
+        print(item)
+# Another thread can call cancel.set(); cancellation is cooperative.
+# For Defender, replace the call arguments with:
+# scan_path(r"C:\Samples", engine="defender", allow_system_effects=True, timeout=120)
+~~~
+
+`scan_path()` 返回扫描结果字典，**不是** CLI 的 JSON 外层结构。前置参数／授权错误抛出 `ScanError`，运行中的失败或部分结果通常通过 `status` 和逐文件结果返回。传入目录会递归扫描。可选 `on_event` 接收包含 `type`、`scan_id` 的扫描事件；回调同步执行，不应阻塞或抛异常。`cancel.set()` 需由其他线程在需要时调用，不会撤销已经发生的副作用。
+
+**4. 直接导入 Python API：查询、启动和停止已安装的主动防御服务**
+
+下面的 `start()` 是真实授权操作，可能记录并保存白名单，然后请求启动服务。它内部执行一小时时效检查，无需调用方先手动记录。记录期间保持机器处于已知干净状态，不启动测试程序；接口不会自动安装服务或提权。
+
+~~~python
+from core.defense_control import start, status, stop
+
+print(status())  # Read-only query of the installed service and baseline metadata.
+result = start(allow_system_effects=True, timeout=120)
+print(result)
+if not result["ready"]:
+    print("Protection readiness is not confirmed; do not run dependent tests.")
+
+# Separate, deliberate stop operation; never implicit cleanup after an uncertain start:
+# result = stop(allow_system_effects=True, timeout=120)
+~~~
+
+这些函数返回 `{ok, ready, code, exit_code, ...}` 字典，而不是 CLI 外层结构。`status()` 成功只表示查询成功。目前所有结果均为 `ready=False`；即使启动后 SCM 为 `RUNNING`，也返回 `readiness_unconfirmed`／退出码 `6`，不能继续防护依赖测试。`start()`、`stop()` 还支持 `cancel_event` 和 `on_event`；服务／记录事件字段为 `event`，不同于扫描事件的 `type`，调用方不要混用。停止示例故意保持注释，避免把停止服务作为启动结果未确认后的自动清理。
+
+**5. 可选：显式调用白名单记录器**
+
+仅在明确要学习并保存新基线时调用。它至少花费 30 秒枚举、散列当前运行的可执行文件，并写入白名单／配置；不是只读检查，也不会启动防御。通常交给 `start()` 自动处理即可。GUI 手动记录会处理自身防御的暂停；直接调用下面的记录器不会替你暂停 GUI 或服务。
+
+~~~python
+from core.whitelist_recording import record_whitelist
+
+result = record_whitelist(duration=30, timeout=120)
+print(result["ok"], result["code"])
+# ok=True means recording was committed, not that defense is ready.
+~~~
 
 #### 配置
 建议通过 GUI 修改偏好。[配置模块](<utils/config.py>) 按运行方式延迟定位数据目录。文本格式的布尔值使用 `1`/`0`，监控路径以 `|` 分隔。CLI 扫描不读取这里的 GUI API 密钥。下面最后两个字段由成功记录一并维护；首次记录前留空，不要伪造或手动推进时间。快照标识缺失或不匹配也会要求重新记录。
