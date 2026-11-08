@@ -694,10 +694,20 @@ class VirusWiseService(win32serviceutil.ServiceFramework):
                 db_conn.close()
 
 
+def run_service_host():
+    """Host the service under SCM, independently of GUI/source/frozen startup.
+
+    StartService arguments arrive in ServiceFramework.__init__, not sys.argv.
+    The baseline handoff is validated by SvcDoRun before any workers/storage.
+    A direct interactive invocation fails in StartServiceCtrlDispatcher.
+    """
+    servicemanager.Initialize()
+    servicemanager.PrepareToHostSingle(VirusWiseService)
+    servicemanager.StartServiceCtrlDispatcher()
+
+
 if __name__ == '__main__':
     if len(sys.argv) == 1:
-        servicemanager.Initialize()
-        servicemanager.PrepareToHostSingle(VirusWiseService)
-        servicemanager.StartServiceCtrlDispatcher()
+        run_service_host()
     else:
         win32serviceutil.HandleCommandLine(VirusWiseService)

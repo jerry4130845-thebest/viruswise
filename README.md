@@ -32,9 +32,7 @@ VirusWise is a Python-based Active Defense security platform designed to detect,
 
 #### Installation
 1. Clone or download the project
-2. Install dependencies:
-   pip install -r requirements.txt
-   Note: Some UI components require customtkinter and PIL
+2. Prepare an environment with `pywin32`, `psutil`, `requests`, `customtkinter`, `Pillow` and `win10toast`. There is currently no dependency manifest. `win10toast` needs setuptools with `pkg_resources` (development environment: setuptools 65.5.0). EXE builds additionally need PyInstaller.
 
 3. Configure the application:
    - Use the GUI settings page; do not edit Python source to configure preferences
@@ -44,16 +42,65 @@ VirusWise is a Python-based Active Defense security platform designed to detect,
 4. Run the application:
    python main.py
 
-#### Running as Windows Service
-Service deployment/installation is a separate administrative step; the CLI only controls an already-installed `VirusWiseActiveDefense`. [main.py](<main.py>) is a GUI entry point, not an install/remove command. Do not use the old no-argument `net start` recipe: the updated service requires the controller’s baseline snapshot handoff. After deployment, use:
+#### Source and EXE deployment
+
+[main.py](<main.py>) now separates GUI, service management, CLI and SCM hosting. No arguments open the GUI; other modes are dispatched before GUI imports, data-directory initialization or GUI elevation.
+
+**Build the Windows onedir distribution** using [viruswise.spec](<viruswise.spec>) in an environment with PyInstaller and the runtime dependencies:
 
 ~~~powershell
-python -B cli.py defense status --json
-python -B cli.py defense start --allow-system-effects --timeout 120 --json
-python -B cli.py defense stop --allow-system-effects --timeout 120 --json
+python -B -m PyInstaller viruswise.spec
+# Read-only checks, no service installation or startup:
+.\dist\VirusWise\VirusWise.exe --help
+.\dist\VirusWise\VirusWise.exe --cli doctor --json
 ~~~
 
-Run start and stop separately, only when intended. A missing service returns exit `3`; the CLI neither installs it nor elevates. SCM running state is not proof of protection readiness.
+Deploy the **entire generated directory** to its final location, not just the EXE. This is onedir with a console, not onefile or windowed mode; the GUI may also show a console. The executable manifest does not require elevation. Only the existing no-argument GUI path may request UAC. The bundle includes Python runtime libraries; target-system compatibility still needs verification.
+
+The spec uses standard hooks, explicit native/service imports, toast icon/metadata and a theme extracted from [ui/theme.py](<ui/theme.py>). It never collects existing user configuration, keys, whitelists, logs or quarantine data. Build-tool support is separate from the source Python minimum: the development build uses Python 3.11 and PyInstaller 6.20.0. The spec does not install dependencies.
+
+**Install** from an administrator PowerShell. Choose source OR EXE deployment, not both:
+
+~~~powershell
+# Source, from the project root:
+python -B main.py --install
+# OR EXE, from its final deployment directory:
+.\VirusWise.exe --install
+~~~
+
+Installation only registers `VirusWiseActiveDefense` as LocalSystem / manual start / own process. It does **not** start protection, record a whitelist, modify directory ACLs or enable boot-time startup. Source ImagePath uses the absolute Python interpreter plus [main.py](<main.py>) and `--service`; EXE ImagePath uses the absolute deployed executable plus `--service`, never a temporary extraction path. Keep that deployment and its dependencies in place and accessible to LocalSystem. Use an administrator-protected production directory: user-writable service code is unsafe.
+
+An identical registration returns `already_installed`; a same-name service with a different command/account/startup/type returns `deployment_mismatch` without modification. Before moving or switching source/EXE deployment, stop and uninstall using the original deployment, then install at the new location. Legacy registrations may require administrator review; they are never silently adopted or overwritten.
+
+**Query/start** via the controller. Choose the commands matching your deployment; start only when intended:
+
+~~~powershell
+# Source; python -B cli.py ... remains supported:
+python -B main.py --cli defense status --json
+python -B main.py --cli defense start --allow-system-effects --timeout 120 --json
+# EXE equivalents:
+.\VirusWise.exe --cli defense status --json
+.\VirusWise.exe --cli defense start --allow-system-effects --timeout 120 --json
+~~~
+
+Non-GUI startup retains the one-hour baseline freshness and snapshot-identity checks and may record/persist a fresh 30-second baseline. The controller passes the snapshot through SCM start arguments. Do not use no-argument `net start` or the Services app: missing-snapshot startup is refused. `--service` is the internal SCM dispatcher, not a manual defense-start command; interactive dispatch fails. Installation success and SCM RUNNING are not protection readiness. Startup still returns `ready=false` / exit `6` until readiness acknowledgement is implemented.
+
+**Stop, then uninstall** only when removal is intended. Choose one deployment and verify stop succeeded before uninstalling:
+
+~~~powershell
+# Source:
+python -B main.py --cli defense stop --allow-system-effects --timeout 120 --json
+python -B main.py --uninstall
+# OR EXE:
+.\VirusWise.exe --cli defense stop --allow-system-effects --timeout 120 --json
+.\VirusWise.exe --uninstall
+~~~
+
+Uninstall verifies the deployment and requires a stopped service; it never implicitly stops it. Only registration is removed; program files, configuration, whitelist and logs are preserved. Open service handles can defer Windows deletion: `pending_delete` / exit `6` means unconfirmed. Only a follow-up SCM query confirming absence yields `uninstalled` / exit `0`. Uninstalling an absent service returns `not_installed` / exit `3`.
+
+**Management output:** `--install` / `--uninstall` are mutually exclusive and accept no extra parameters (do not append `--json`). They output a controller-result JSON object with `ok`, `ready`, `code`, `exit_code`, and the corresponding `install_requested` / `uninstall_requested` flag, **not** the CLI envelope. Invalid-argument/platform errors can occur before the controller runs. Codes: `2` invalid arguments, `3` unavailable/not installed, `4` denied, `5` failure, `6` deletion unconfirmed, `130` interrupted. Requested flags preserve possible effects after failure/interruption; query before retrying. No automatic elevation occurs. `--cli ...` retains the CLI JSON/JSONL schema and consent flags; its capabilities describe the CLI, not the separate installer.
+
+Python subprocess callers can use `[r"C:\Apps\VirusWise\VirusWise.exe", "--cli", "doctor", "--json"]` in place of the source argument list shown below, preserving JSON parsing, timeouts and exit-code checks. Build/read-only smoke tests do not validate the SCM lifecycle or protection effectiveness; perform real lifecycle tests only on an explicitly authorized Windows test system.
 
 ### Usage
 
@@ -139,7 +186,7 @@ python -B cli.py defense stop --allow-system-effects --timeout 120 --json
 
 #### Calling VirusWise from a terminal or another program
 
-**Choose the entry point:** use [main.py](<main.py>) for the GUI (it may request UAC and initialize application data); use [cli.py](<cli.py>) for automation without GUI startup. Run commands from the project root after installing the dependencies above. A packaged GUI executable is not documented as a CLI executable; the examples here use the Python source entry point.
+**Choose the entry point:** use [main.py](<main.py>) for the GUI (it may request UAC and initialize application data); use [cli.py](<cli.py>) for automation without GUI startup. Run commands from the project root after installing the dependencies above. The directory-built EXE accepts the same CLI arguments after `--cli`: replace `python -B cli.py` with `VirusWise.exe --cli`. Separate install/uninstall modes are documented above.
 
 **1. Windows PowerShell: launch, configure a session key, and capture the exit code**
 
@@ -342,9 +389,7 @@ VirusWise 是一个基于 Python 的主动防御安全平台，旨在实时检�
 
 #### 安装
 1. 下载或克隆项目
-2. 安装依赖:
-   pip install -r requirements.txt
-   注意: 部分 UI 组件需要 customtkinter 和 PIL
+2. 准备包含 `pywin32`、`psutil`、`requests`、`customtkinter`、`Pillow` 和 `win10toast` 的环境。仓库当前没有依赖清单；`win10toast` 需要提供 `pkg_resources` 的 setuptools（开发环境为 65.5.0）。打包 EXE 另需 PyInstaller。
 
 3. 配置应用程序:
    - 使用 GUI 设置页面配置偏好，不要通过修改 Python 源码配置程序
@@ -354,16 +399,65 @@ VirusWise 是一个基于 Python 的主动防御安全平台，旨在实时检�
 4. 运行应用程序:
    python main.py
 
-#### 作为 Windows 服务运行
-服务部署／安装属于单独的管理员操作；CLI 只控制已经安装的 `VirusWiseActiveDefense`。[main.py](<main.py>) 是 GUI 入口，不支持安装／卸载服务子命令。不要沿用旧的无参数 `net start` 示例：新版服务需要控制器传入白名单快照。完成服务部署后，分别按需调用：
+#### 源码与 EXE 部署
+
+[main.py](<main.py>) 现在区分 GUI、服务管理、CLI 和 SCM 托管。不带参数才打开 GUI；其他模式在 GUI 导入、数据目录初始化和 GUI 提权之前分流。
+
+**构建 Windows onedir 目录式发行包**：在准备好 PyInstaller 和运行依赖的环境中，使用 [viruswise.spec](<viruswise.spec>)：
 
 ~~~powershell
-python -B cli.py defense status --json
-python -B cli.py defense start --allow-system-effects --timeout 120 --json
-python -B cli.py defense stop --allow-system-effects --timeout 120 --json
+python -B -m PyInstaller viruswise.spec
+# 只读检查，不安装或启动服务：
+.\dist\VirusWise\VirusWise.exe --help
+.\dist\VirusWise\VirusWise.exe --cli doctor --json
 ~~~
 
-不要把启动和停止当作一段必须连续执行的脚本。服务未安装时返回退出码 `3`，CLI 不会自动安装或提权。SCM 运行状态不代表防护已就绪。
+必须把**生成的整个目录**部署到最终位置，不能只拷走 EXE。本次为保留控制台的 onedir，不是 onefile 或 windowed 模式，GUI 也可能伴随控制台。EXE 清单不要求全局提权，只有原有无参数 GUI 路径可能弹出 UAC。发行包包含 Python 运行库，目标机器原则上无需另装 Python，但仍需验证目标环境兼容性。
+
+打包配置采用标准 hooks、显式原生／服务模块入口、通知图标及元数据，以及从 [ui/theme.py](<ui/theme.py>) 常量提取的主题；不收集现存用户配置、密钥、白名单、日志或隔离数据。构建工具的支持范围与源码最低 Python 版本不同：开发构建环境为 Python 3.11、PyInstaller 6.20.0。打包配置不会自动安装依赖。
+
+**安装服务**：在管理员 PowerShell 中按部署方式二选一，不要同时安装源码与 EXE 版本：
+
+~~~powershell
+# 源码：在项目根目录
+python -B main.py --install
+# 或 EXE：在最终部署目录
+.\VirusWise.exe --install
+~~~
+
+安装仅将 `VirusWiseActiveDefense` 注册为 LocalSystem／手动启动／独立进程服务，**不启动防御、不记录白名单、不修改目录 ACL、不设置开机自启**。源码 ImagePath 使用绝对 Python 解释器路径、[main.py](<main.py>) 和 `--service`；EXE ImagePath 使用最终部署 EXE 的绝对路径和 `--service`，不使用临时解压路径。注册后不要移动部署文件及依赖，须确保 LocalSystem 可访问。正式部署使用管理员保护的目录，让普通用户可替换服务代码是不安全的。
+
+完全相同的注册返回 `already_installed`；同名服务命令、账户、启动类型或服务类型不同，则返回 `deployment_mismatch`，不修改原注册。移动位置或切换源码／EXE 前，应使用原部署停止并卸载，再在新位置安装。旧式注册可能需要管理员人工检查，不会被静默接管或覆盖。
+
+**查询／启动**仍由控制器完成。只选择适合自己部署的命令，确实要启动时才执行 start：
+
+~~~powershell
+# 源码；原有 python -B cli.py ... 仍可用：
+python -B main.py --cli defense status --json
+python -B main.py --cli defense start --allow-system-effects --timeout 120 --json
+# EXE 对应命令：
+.\VirusWise.exe --cli defense status --json
+.\VirusWise.exe --cli defense start --allow-system-effects --timeout 120 --json
+~~~
+
+非 GUI 启动仍执行一小时时效和快照身份检查，必要时重新记录并保存 30 秒白名单；控制器通过 SCM 启动参数传入快照。不要用不带快照的 `net start` 或服务管理器启动，缺少快照的启动会被拒绝。`--service` 只是内部 SCM 调度入口，不是人工启动防御命令，直接交互调用会失败。安装成功和 SCM RUNNING 都不代表防护就绪；实现就绪确认协议之前，启动仍返回 `ready=false`／退出码 `6`。
+
+**先停止，再卸载**：仅在确实要移除注册时执行。按部署方式二选一，并确认停止成功后再卸载：
+
+~~~powershell
+# 源码：
+python -B main.py --cli defense stop --allow-system-effects --timeout 120 --json
+python -B main.py --uninstall
+# 或 EXE：
+.\VirusWise.exe --cli defense stop --allow-system-effects --timeout 120 --json
+.\VirusWise.exe --uninstall
+~~~
+
+卸载先核对部署身份，并要求服务已停止，不会隐式停止服务。只移除注册，保留程序文件、配置、白名单和日志。其他服务句柄未关闭时，Windows 可能延迟删除：`pending_delete`／退出码 `6` 表示未确认；只有后续 SCM 查询确认不存在才返回 `uninstalled`／退出码 `0`。卸载不存在的服务返回 `not_installed`／退出码 `3`。
+
+**管理命令输出：** `--install`／`--uninstall` 互斥且不接受额外参数（不要追加 `--json`），返回控制器结果 JSON，含 `ok`、`ready`、`code`、`exit_code` 和对应的 `install_requested`／`uninstall_requested`，**不是** CLI 响应信封。参数／平台错误可能在进入控制器前返回。退出码：`2` 参数错误、`3` 不可用／未安装、`4` 拒绝访问、`5` 失败、`6` 删除未确认、`130` 中断。requested 标志在失败／中断后保留可能已提交操作的证据，重试前先查状态；不会自动提权。`--cli ...` 保持原有 JSON／JSONL 协议及授权参数，它的 capabilities 描述 CLI 本身，不是独立安装器。
+
+Python subprocess 调用 EXE 时，可将下文源码示例的参数列表换成 `[r"C:\Apps\VirusWise\VirusWise.exe", "--cli", "doctor", "--json"]`，保留 JSON 解析、超时及退出码检查。构建和只读冒烟测试不等于 SCM 生命周期或防护有效性验证；真实安装／启停／卸载仅在明确授权的 Windows 测试环境执行。
 
 ### 使用方法
 
@@ -449,7 +543,7 @@ python -B cli.py defense stop --allow-system-effects --timeout 120 --json
 
 #### 如何从终端或其他程序调用 VirusWise
 
-**先选入口：**人工操作使用 [main.py](<main.py>) 启动 GUI（可能弹出 UAC，并初始化应用数据）；脚本集成使用不启动 GUI 的 [cli.py](<cli.py>)。先按上面的安装步骤准备依赖，再在项目根目录执行命令。这里说明的是 Python 源码入口，不代表打包后的 GUI 可执行文件也支持这些 CLI 参数。
+**先选入口：**人工操作使用 [main.py](<main.py>) 启动 GUI（可能弹出 UAC，并初始化应用数据）；脚本集成使用不启动 GUI 的 [cli.py](<cli.py>)。先按上面的安装步骤准备依赖，再在项目根目录执行命令。目录式 EXE 通过 `--cli` 接受相同参数：将 `python -B cli.py` 换成 `VirusWise.exe --cli`。独立的安装／卸载模式见上方部署说明。
 
 **1. Windows PowerShell：启动程序、设置临时密钥、获取退出码**
 

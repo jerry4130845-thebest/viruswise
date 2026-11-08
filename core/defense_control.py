@@ -1,6 +1,7 @@
-"""Explicit control of the installed VirusWiseActiveDefense service only.
+"""Explicit control and provisioning of the VirusWiseActiveDefense service.
 
-No installation, elevation, ACL changes, or import-time platform dependencies.
+Installation/removal require explicit consent; no elevation, ACL changes, or
+import-time platform dependencies.
 All public results are JSON-compatible dicts with ok/ready/code/exit_code.
 RUNNING is never a readiness acknowledgement. Until an authenticated service
 snapshot acknowledgement protocol exists, ready is always False (exit 6 for
@@ -14,6 +15,8 @@ that is another reason SCM RUNNING alone cannot prove protection.
 import json
 import math
 import os
+import subprocess
+import sys
 import time
 
 SERVICE_NAME = 'VirusWiseActiveDefense'
@@ -128,6 +131,170 @@ class _Service:
 
     def stop(self):
         self.api.ControlService(self.handle, self.api.SERVICE_CONTROL_STOP)
+
+
+def service_command():
+    """Canonical SCM ImagePath for this deployment; never use bundle extraction paths."""
+    if not sys.executable:
+        raise DefenseControlError('invalid_deployment', 'Executable path is unavailable')
+    args = [os.path.abspath(sys.executable)]
+    if not getattr(sys, 'frozen', False):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        args.append(os.path.join(root, 'main.py'))
+    args.append('--service')
+    return subprocess.list2cmdline(args)
+
+
+def _deployment_api():
+    if os.name != 'nt':
+        raise DefenseControlError('unsupported_platform', 'Service control requires Windows', 3)
+    try:
+        import win32service
+    except ImportError as exc:
+        raise DefenseControlError('dependency_missing', 'pywin32 is required for service control', 3) from exc
+    return win32service
+
+
+def _winerror(exc):
+    code = getattr(exc, 'winerror', None)
+    return code if code is not None else (exc.args[0] if exc.args else None)
+
+
+class _DeploymentHandles:
+    """Close every acquired handle, even if an earlier close fails or is interrupted."""
+    def __init__(self, api):
+        self.api = api
+        self.handles = []
+
+    def __enter__(self):
+        return self
+
+    def own(self, handle):
+        self.handles.append(handle)
+        return handle
+
+    def close(self, handle):
+        self.api.CloseServiceHandle(handle)
+        self.handles.remove(handle)
+
+    def __exit__(self, exc_type, exc, traceback):
+        failure = None
+        while self.handles:
+            handle = self.handles.pop()
+            try:
+                self.api.CloseServiceHandle(handle)
+            except (Exception, KeyboardInterrupt) as close_error:
+                if failure is None or isinstance(close_error, KeyboardInterrupt):
+                    failure = close_error
+        if failure is not None and (exc is None or isinstance(failure, KeyboardInterrupt)):
+            raise failure
+
+
+def _check_deployment(api, handle, command):
+    config = api.QueryServiceConfig(handle)
+    # Exact ImagePath matching is deliberate: do not adopt an ambiguous command
+    # or repair another deployment, even if it uses the same service name.
+    if (config[0] != api.SERVICE_WIN32_OWN_PROCESS
+            or config[1] != api.SERVICE_DEMAND_START
+            or config[3] != command
+            or str(config[7]).casefold() != 'localsystem'):
+        raise DefenseControlError('deployment_mismatch',
+                                  'Existing service belongs to a different deployment or configuration',
+                                  next_action='Review the existing service manually; its configuration was not changed')
+
+
+def _pending_delete():
+    return _result(False, 'pending_delete', exit_code=6,
+                   error='Service deletion is pending or could not be confirmed',
+                   next_action='Wait for outstanding service handles to close, then query again; no stop was requested')
+
+
+def _deployment_failure(exc):
+    if not isinstance(exc, KeyboardInterrupt) and _winerror(exc) == 1072:
+        return _pending_delete()
+    return _failure(exc)
+
+
+def install(allow_system_effects=False):
+    """Register this deployment without starting it or changing an existing service.
+
+    install_requested records possible CreateService effects, including interrupted
+    submissions. SCM access checks are authoritative; no automatic elevation occurs.
+    """
+    requested = False
+    try:
+        if allow_system_effects is not True:
+            raise DefenseControlError('authorization_required', 'Install requires allow_system_effects=True', 4)
+        api = _deployment_api()
+        command = service_command()
+        with _DeploymentHandles(api) as handles:
+            manager = handles.own(api.OpenSCManager(
+                None, None, api.SC_MANAGER_CONNECT | api.SC_MANAGER_CREATE_SERVICE))
+            try:
+                handle = handles.own(api.OpenService(manager, SERVICE_NAME, api.SERVICE_QUERY_CONFIG))
+            except Exception as exc:
+                if _winerror(exc) != 1060:
+                    raise
+                requested = True  # The submission can succeed before an interruption.
+                try:
+                    handle = handles.own(api.CreateService(
+                        manager, SERVICE_NAME, SERVICE_NAME, api.SERVICE_QUERY_CONFIG,
+                        api.SERVICE_WIN32_OWN_PROCESS, api.SERVICE_DEMAND_START,
+                        api.SERVICE_ERROR_NORMAL, command, None, 0, None, None, None))
+                except Exception as create_error:
+                    if _winerror(create_error) != 1073:  # A concurrent installer won.
+                        raise
+                    handle = handles.own(api.OpenService(manager, SERVICE_NAME, api.SERVICE_QUERY_CONFIG))
+                    _check_deployment(api, handle, command)
+                    return _result(True, 'already_installed', install_requested=requested)
+                _check_deployment(api, handle, command)
+                return _result(True, 'installed', install_requested=True)
+            _check_deployment(api, handle, command)
+            return _result(True, 'already_installed', install_requested=False)
+    except (Exception, KeyboardInterrupt) as exc:
+        result = _deployment_failure(exc)
+        result['install_requested'] = requested
+        return result
+
+
+def uninstall(allow_system_effects=False):
+    """Delete only this deployment while stopped; never stop it implicitly.
+
+    Absence is not_installed/3, not an idempotent success. DeleteService only marks
+    deletion: success requires a subsequent OpenService reporting absence (1060).
+    """
+    requested = False
+    deleted = False
+    try:
+        if allow_system_effects is not True:
+            raise DefenseControlError('authorization_required', 'Uninstall requires allow_system_effects=True', 4)
+        api = _deployment_api()
+        command = service_command()
+        with _DeploymentHandles(api) as handles:
+            manager = handles.own(api.OpenSCManager(None, None, api.SC_MANAGER_CONNECT))
+            # DELETE is a standard Windows access right, not SERVICE_ALL_ACCESS.
+            access = api.SERVICE_QUERY_CONFIG | api.SERVICE_QUERY_STATUS | 0x00010000
+            handle = handles.own(api.OpenService(manager, SERVICE_NAME, access))
+            _check_deployment(api, handle, command)
+            if api.QueryServiceStatusEx(handle)['CurrentState'] != api.SERVICE_STOPPED:
+                raise DefenseControlError('service_busy', 'Uninstall requires a stopped service',
+                                          next_action='Explicitly stop defense before uninstalling; no stop was requested')
+            requested = True
+            api.DeleteService(handle)
+            deleted = True
+            handles.close(handle)  # Our own handle must not keep deletion pending.
+            try:
+                handles.own(api.OpenService(manager, SERVICE_NAME, api.SERVICE_QUERY_STATUS))
+            except Exception as exc:
+                if _winerror(exc) == 1060:
+                    return _result(True, 'uninstalled', uninstall_requested=True)
+                return dict(_pending_delete(), uninstall_requested=True)
+            return dict(_pending_delete(), uninstall_requested=True)
+    except (Exception, KeyboardInterrupt) as exc:
+        result = (_pending_delete() if deleted and not isinstance(exc, KeyboardInterrupt)
+                  else _deployment_failure(exc))
+        result['uninstall_requested'] = requested
+        return result
 
 
 def _baseline():

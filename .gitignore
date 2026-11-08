@@ -4,5 +4,5 @@
 *.pyd
 **/data/
 **/quarantine/
-*.gitignore
 crash.log
+viruswise.spec
