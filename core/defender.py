@@ -1,9 +1,15 @@
+import math
 import os
 import subprocess
 import time
 
 from utils.logging import main_log
-from utils.network import is_offline
+
+
+def is_offline():
+    """Load the optional network dependency only for automatic engine choice."""
+    from utils.network import is_offline as probe
+    return probe()
 
 
 class DefenderScanner:
@@ -12,7 +18,18 @@ class DefenderScanner:
     WAIT_INTERVAL = 0.25
     CLIENT_STOP_TIMEOUT = 2
 
-    def __init__(self, offline_only=True, force_use=False, logger=None):
+    def __init__(self, offline_only=True, force_use=False, logger=None, timeout=None,
+                 deadline=None):
+        if timeout is not None:
+            if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                    or not math.isfinite(timeout) or timeout <= 0):
+                raise ValueError("timeout must be a positive finite number")
+        if deadline is not None:
+            if (isinstance(deadline, bool) or not isinstance(deadline, (int, float))
+                    or not math.isfinite(deadline)):
+                raise ValueError("deadline must be a finite monotonic timestamp")
+        self.timeout = timeout
+        self.deadline = deadline
         self._log = main_log if logger is None else logger
         self.available = False
         self.offline_only = offline_only
@@ -85,7 +102,17 @@ class DefenderScanner:
 
         process = None
         try:
-            deadline = time.monotonic() + self.SCAN_TIMEOUT
+            now = time.monotonic()
+            deadline = now + (
+                self.SCAN_TIMEOUT if self.timeout is None else self.timeout
+            )
+            if self.deadline is not None:
+                deadline = min(deadline, self.deadline)
+            if deadline <= now:
+                return self._result(
+                    'timeout', error="扫描等待超时",
+                    message="任务期限已到，未启动扫描客户端。",
+                )
             # Do not parse localized console output or leave unread PIPEs that
             # can deadlock a long scan. Return code is execution evidence only.
             process = subprocess.Popen(
@@ -133,6 +160,11 @@ class DefenderScanner:
                 error=f"MpCmdRun 返回非零代码: {returncode}",
                 message="扫描未能确认成功，可能存在未处置威胁或执行错误。",
             )
+        except KeyboardInterrupt:
+            # Ctrl+C must reap our client too; it cannot stop service-side work.
+            if process is not None:
+                self._stop_client(process)
+            raise
         except Exception as exc:
             cleanup = self._stop_client(process) if process is not None else ""
             status = 'unavailable' if isinstance(exc, FileNotFoundError) else 'failed'

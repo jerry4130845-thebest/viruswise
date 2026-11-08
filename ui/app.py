@@ -36,64 +36,66 @@ API_KEY = ""
 
 
 def record_processes_for_30_seconds():
-    ad_was_running = False
+    from core.whitelist_recording import record_whitelist
     app = getattr(sys, 'app', None)
-    if app and app.ad and app.ad.running:
-        ad_was_running = True
-        app.ad.stop()
-    main_log("主动防御已暂停，开始记录白名单...")
+    if app is None or getattr(app, '_closing', False):
+        return
+    if getattr(app, '_record_cancel', None) is not None:
+        main_log('白名单记录已在进行中')
+        return
+    cancel = threading.Event()
+    app._record_cancel = cancel
+    ad_was_running = bool(app.ad and app.ad.running)
+    if ad_was_running:
+        try:
+            app.ad.stop()
+        except Exception:
+            app._record_cancel = None
+            main_log('GUI主动防御未能暂停，拒绝开始白名单记录')
+            return
+    main_log("开始30秒白名单记录；记录期间不要启动测试程序")
     popup = ctk.CTkToplevel(app)
     popup.title("白名单记录中")
     popup.geometry("300x150")
     popup.attributes("-topmost", True)
-    ctk.CTkLabel(popup, text="正在记录进程到白名单\n持续时间: 30秒\n主动防御已暂停", font=("Arial", 12)).pack(pady=20)
+    popup.protocol("WM_DELETE_WINDOW", cancel.set)
+    ctk.CTkLabel(popup, text="正在记录进程到白名单\n持续时间: 至少30秒\n本次GUI主动防御已暂停", font=("Arial", 12)).pack(pady=20)
     popup.update()
 
-    def record():
-        whitelist = load_whitelist()
-        existing = {item.get('hash') for item in whitelist if item.get('hash')}
-        count = 0
-        recorded = set()
-        for _ in range(30):
-            try:
-                for proc in psutil.process_iter(['pid', 'name', 'exe']):
+    def finish(result):
+        try:
+            if result['ok']:
+                main_log(f"白名单记录成功，新增 {result['added']} 项，已更新成功时间")
+                if result.get('error_count'):
+                    main_log(f"其中 {result['error_count']} 项无法记录，不代表这些进程安全")
+                if hasattr(app, 'refresh_whitelist_display'):
+                    app.refresh_whitelist_display()
+                if (ad_was_running and not getattr(app, '_closing', False)
+                        and admod.ACTIVE_DEFENSE_ENABLED and admod.WATCHDOG_AVAILABLE):
                     try:
-                        pid = proc.info['pid']
-                        if pid in recorded: continue
-                        name, exe = proc.info['name'], proc.info['exe']
-                        if name.lower() in SYSTEM_PROCESSES: recorded.add(pid); continue
-                        if exe and os.path.exists(exe):
-                            try:
-                                with open(exe, 'rb') as f: h = hashlib.sha256(f.read()).hexdigest()
-                                if h not in existing:
-                                    whitelist.append({'name': name, 'pid': pid, 'path': exe, 'hash': h, 'time': time.time()})
-                                    existing.add(h); recorded.add(pid); count += 1
-                            except: pass
-                    except: pass
-            except: pass
-            time.sleep(1)
-        save_whitelist(whitelist)
-        if ad_was_running and admod.ACTIVE_DEFENSE_ENABLED and admod.WATCHDOG_AVAILABLE and getattr(sys, 'app', None):
-            try:
-                sys.app.ad = admod.ActiveDefense()
-                sys.app.ad.start(admod.MONITOR_DIRS)
-                main_log(f"30秒记录完成，共添加 {count} 个新进程到白名单，主动防御已恢复")
-            except Exception as e:
-                main_log(f"主动防御恢复失败: {e}")
-        else:
-            main_log(f"30秒记录完成，共添加 {count} 个新进程到白名单")
-        # 在主线程销毁弹窗，避免后台线程操作 tkinter 控件
-        app = getattr(sys, 'app', None)
-        if app:
-            app.after(0, popup.destroy)
-        else:
-            try:
-                popup.after(0, popup.destroy)
-            except RuntimeError:
-                pass
-            except:
-                pass
+                        app.ad = admod.ActiveDefense()
+                        app.ad.start(admod.MONITOR_DIRS)
+                        main_log("GUI主动防御已恢复")
+                    except Exception as exc:
+                        main_log(f"主动防御恢复失败: {exc}")
+            else:
+                main_log(f"白名单记录失败，未更新成功时间，防御不自动恢复: {result.get('code')}")
+        finally:
+            if getattr(app, '_record_cancel', None) is cancel:
+                app._record_cancel = None
+            if popup.winfo_exists():
+                popup.destroy()
+
+    def record():
+        # GUI manual recording updates the shared timestamp but has no hourly gate.
+        result = record_whitelist(cancel_event=cancel)
+        try:
+            app.after(0, lambda: finish(result))
+        except (RuntimeError, tk.TclError):
+            pass  # GUI closed; do not restart defense from this worker.
+
     threading.Thread(target=record, daemon=True).start()
+
 
 class VirusWiseApp(ctk.CTk):
     def __init__(self):
@@ -1134,6 +1136,7 @@ class VirusWiseApp(ctk.CTk):
         self._scan_id += 1
         self._scan_cancel = threading.Event()
         task = MappingProxyType({'scan_id': self._scan_id, 'cancel': self._scan_cancel,
+                                 'allow_network': mode in ('单文件查杀', '文件夹查杀'),
                                  'allow_upload': bool(allow_upload),
                                  'config': MappingProxyType(dict(self.config))})
         self.prepare_scan_ui()
@@ -1182,98 +1185,38 @@ class VirusWiseApp(ctk.CTk):
                     remediation_state='not_attempted', can_quarantine=False, **extra)
 
     def _scan_vt_file(self, path, task, whitelist_hashes, poll_attempts):
-        result = self._scan_result(task, path)
-        cancel = task['cancel']
-        if cancel.is_set():
-            result['status'] = 'cancelled'
-            return result
-        try:
-            api_key = task['config'].get('apikey', '').strip()
-            if not api_key:
-                raise ValueError("API Key为空")
-            if not os.path.isfile(path):
-                raise ValueError("文件不存在或不是普通文件")
-            h = get_file_hash(path)
-            result['sha256'] = h
-            if not h:
-                raise ValueError("无法计算SHA256，文件尚未判定")
-            if h in whitelist_hashes:
-                result.update(status='completed', verdict='whitelisted', type='白名单跳过（未经扫描）')
-                return result
-            headers = {"x-apikey": api_key}
-            if cancel.is_set():
-                result['status'] = 'cancelled'
-                return result
-            response = requests.get(f"{BASE_URL}/files/{h}", headers=headers, timeout=30)
-            uploaded = False
-            if cancel.is_set():
-                result['status'] = 'cancelled'
-                return result
-            if response.status_code == 404:
-                if not task['allow_upload']:
-                    result['error'] = "VT未收录；未授权上传，仅查询哈希，未判定"
-                    return result
-                if os.path.getsize(path) > MAX_UPLOAD_SIZE:
-                    result['error'] = "VT未收录且文件超过30MB；不上传，未判定"
-                    return result
-                # Consent is task-local. Check cancellation immediately before any POST.
-                with open(path, 'rb') as file:
-                    if os.fstat(file.fileno()).st_size > MAX_UPLOAD_SIZE:
-                        result['error'] = "文件已增大至超过30MB；不上传，未判定"
-                        return result
-                    if cancel.is_set():
-                        result['status'] = 'cancelled'
-                        return result
-                    response = requests.post(f"{BASE_URL}/files", headers=headers,
-                                             files={'file': (os.path.basename(path), file)}, timeout=60)
-                if response.status_code != 200:
-                    raise ValueError(f"VT上传失败 HTTP {response.status_code}")
-                analysis_id = response.json().get('data', {}).get('id')
-                if not isinstance(analysis_id, str) or not analysis_id:
-                    raise ValueError("VT未返回有效分析ID")
-                uploaded = True
-                for _ in range(poll_attempts):
-                    if cancel.wait(5):
-                        result['status'] = 'cancelled'
-                        return result
-                    response = requests.get(f"{BASE_URL}/analyses/{analysis_id}", headers=headers, timeout=30)
-                    if response.status_code != 200:
-                        raise ValueError(f"VT分析查询失败 HTTP {response.status_code}")
-                    attributes = response.json().get('data', {}).get('attributes', {})
-                    if attributes.get('status') == 'completed':
-                        stats = attributes.get('stats')
-                        break
-                else:
-                    result.update(status='pending', error='VT分析尚未完成，等待超时；未判定')
-                    return result
-            elif response.status_code == 200:
-                stats = response.json().get('data', {}).get('attributes', {}).get('last_analysis_stats')
-            else:
-                raise ValueError(f"VT查询失败 HTTP {response.status_code}")
-            if cancel.is_set():
-                result['status'] = 'cancelled'
-                return result
-            if (not isinstance(stats, dict) or 'malicious' not in stats or 'suspicious' not in stats
-                    or any(type(v) is not int or v < 0 for v in stats.values())):
-                raise ValueError("VT统计数据缺失或格式无效，未判定")
-            if sum(stats.get(k, 0) for k in ('malicious', 'suspicious', 'harmless', 'undetected')) == 0:
-                result['error'] = "VT未提供有效引擎判定，不能视为安全"
-                return result
-            malicious, suspicious = stats['malicious'], stats['suspicious']
-            threshold = 1 if task['config'].get('sensitive') else 6
-            flagged = malicious >= threshold
-            result.update(status='completed', verdict='malicious' if flagged else 'not_flagged',
-                          malicious=malicious, suspicious=suspicious, can_quarantine=flagged,
-                          type=('恶意' if flagged else '未达到报警阈值') + ('(上传分析)' if uploaded else ''))
-        except Exception as exc:
-            result.update(status='failed', error=str(exc))
-        return result
+        from core.scanning import scan_vt_file
+        return scan_vt_file(path, task, whitelist_hashes, poll_attempts)
 
-    def single_file_scan(self, target, task):
+    def _scan_vt_path(self, target, task, poll_attempts):
+        from core.scanning import scan_path
         whitelist = load_whitelist()
         hashes = {item.get('hash') for item in whitelist if item.get('hash')}
-        result = self._scan_vt_file(target, task, hashes, 20)
-        return {'results': [result], 'status': result['status']}
+        completed = 0
+
+        def on_event(event):
+            nonlocal completed
+            if event['type'] == 'result':
+                completed += 1
+                event['result']['scan_id'] = task['scan_id']
+                self._post_scan_event(task['scan_id'], "progress", (
+                    0, f"扫描中，已完成 {completed} 项: {os.path.basename(event['result']['path'])}"))
+
+        outcome = scan_path(
+            target, 'virustotal', allow_network=task.get('allow_network', False),
+            allow_upload=task['allow_upload'], api_key=task['config'].get('apikey', ''),
+            sensitive=task['config'].get('sensitive', False), whitelist_hashes=hashes,
+            cancel_event=task['cancel'], timeout=task.get('timeout', 7200),
+            poll_attempts=poll_attempts, on_event=on_event)
+        outcome['scan_id'] = task['scan_id']
+        for item in outcome['results']:
+            item['scan_id'] = task['scan_id']
+        return outcome
+
+    def single_file_scan(self, target, task):
+        if not os.path.isfile(target):
+            return {'results': [], 'status': 'failed', 'message': '目标不是有效文件'}
+        return self._scan_vt_path(target, task, 20)
 
     def full_scan(self, target, task):
         scan_id = task['scan_id']
@@ -1300,33 +1243,15 @@ class VirusWiseApp(ctk.CTk):
     def folder_scan(self, target, task):
         if not os.path.isdir(target):
             return {'results': [], 'status': 'failed', 'message': '目标不是有效文件夹'}
-        files, walk_errors = [], []
-        for root, dirs, names in os.walk(target, onerror=lambda exc: walk_errors.append(str(exc))):
-            if task['cancel'].is_set():
-                return {'results': [], 'status': 'cancelled'}
-            files.extend(os.path.join(root, name) for name in names)
-        whitelist = load_whitelist()
-        hashes = {item.get('hash') for item in whitelist if item.get('hash')}
-        results = []
-        for idx, path in enumerate(files, 1):
-            if task['cancel'].is_set():
-                break
-            self._post_scan_event(task['scan_id'], "progress", (int(idx / len(files) * 100),
-                                  f"扫描中 {idx}/{len(files)}: {os.path.basename(path)}"))
-            results.append(self._scan_vt_file(path, task, hashes, 6))
-        status = 'completed' if all(r['status'] == 'completed' for r in results) else 'partial'
-        message = ''
-        if walk_errors:
-            status = 'partial'
-            message = '扫描不完整，部分目录无法读取：' + '; '.join(walk_errors)
-        if task['cancel'].is_set():
-            status = 'cancelled'
-        return {'results': results, 'status': status, 'message': message}
+        return self._scan_vt_path(target, task, 6)
 
     def destroy(self):
         if self._closing:
             return
         self._closing = True
+        recording_cancel = getattr(self, '_record_cancel', None)
+        if recording_cancel is not None:
+            recording_cancel.set()
         self._shutdown_during_scan = self.scanning
         self._scan_cancel.set()
         self._signature_cancel.set()

@@ -35,6 +35,73 @@ MONITOR_DIRS = []
 # can disable this optional feature instead of raising AttributeError.
 WATCHDOG_AVAILABLE = False
 
+class WhitelistGuard:
+    """Content-hash exemptions shared by GUI and service enforcement paths.
+
+    Never trust a PID, name, cached caller hash, or SYSTEM-profile whitelist.
+    Hash the executable resolved from the current process before each action.
+    """
+    def __init__(self, entries):
+        self.replace(entries)
+
+    def replace(self, entries):
+        from utils.whitelist import snapshot_identity
+        identity = snapshot_identity(entries)
+        hashes = frozenset(item['hash'].lower() for item in entries if item.get('hash'))
+        self._snapshot = (identity, hashes)
+        return identity
+
+    @property
+    def snapshot_id(self):
+        return self._snapshot[0]
+
+    def allows(self, proc_info):
+        try:
+            process = psutil.Process(proc_info['pid'])
+            expected_created = proc_info.get('create_time')
+            if expected_created is None or process.create_time() != expected_created:
+                # Do not score or enforce a stale event against a reused PID.
+                raise RuntimeError('Process identity changed before whitelist check')
+            path = process.exe()
+            digest = hashlib.sha256()
+            with open(path, 'rb') as stream:
+                before = os.fstat(stream.fileno())
+                for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                    digest.update(chunk)
+                after = os.fstat(stream.fileno())
+            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                raise RuntimeError('Executable changed during whitelist check')
+            return digest.hexdigest() in self._snapshot[1]
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            log_block(f"Whitelist lookup failed for PID {proc_info.get('pid')}: {exc}")
+            # Unverifiable identity is not permission to suspend/terminate.
+            raise RuntimeError('Cannot verify process against whitelist') from exc
+
+
+def _baseline_from_service_args(args):
+    """Use only caller's SCM handoff, never LocalSystem profile defaults."""
+    from core.defense_control import BASELINE_ARGUMENT, MAX_HANDOFF_BYTES
+    from utils.whitelist import snapshot_identity
+    if len(args) != 3 or args[1] != BASELINE_ARGUMENT:
+        raise ValueError('Explicit whitelist snapshot handoff is required; start through defense_control')
+    if len(args[2].encode('utf-8')) > MAX_HANDOFF_BYTES:
+        raise ValueError('Whitelist handoff exceeds size limit')
+    payload = json.loads(args[2])
+    if not isinstance(payload, dict) or payload.get('version') != 1:
+        raise ValueError('Unsupported whitelist handoff')
+    stamp = payload.get('recorded_at')
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or not 0 <= time.time() - stamp <= 3600:
+        raise ValueError('Whitelist handoff is expired or has an invalid timestamp')
+    entries = payload.get('entries')
+    identity = snapshot_identity(entries)
+    expected = payload.get('snapshot_id')
+    if not isinstance(expected, str) or not hmac.compare_digest(identity, expected):
+        raise ValueError('Whitelist handoff identity mismatch')
+    return WhitelistGuard(entries)
+
+
 class ActiveDefense:
     def __init__(self):
         self.running = False
@@ -42,39 +109,54 @@ class ActiveDefense:
         self.pipeline = None
         self.attribution = None
         self.db_conn = None
+        self.whitelist = None
 
     def start(self, monitor_dirs=None):
         if self.running:
             return
-        self.running = True
-        init_service_environment()
-        config = verify_or_create_config()
-        self.db_conn = init_db()
-        
-        scoring = ScoringEngine(self.db_conn, config)
-        self.attribution = AttributionEngine()
-        
-        def handle_event(proc_info):
-            fp = scoring.compute_fingerprint(proc_info)
-            cursor = self.db_conn.cursor()
-            cursor.execute("SELECT 1 FROM block_rules WHERE fingerprint = ?", (fp,))
-            if cursor.fetchone():
-                log_block(f"命中持久化阻断规则！立即终止/拦截新实例 PID {proc_info.get('pid')}")
-                try:
-                    psutil.Process(proc_info.get('pid')).terminate()
-                except Exception:
-                    pass
-                return
-            scoring.evaluate(proc_info, "system_write")
-            try:
-                ad_queue.put_nowait(('file_event', proc_info.get('name'), 'system_write'))
-            except queue.Full:
-                pass
+        # GUI intentionally has no hourly recording policy. A readable hashed
+        # baseline is still mandatory before any enforcement worker starts.
+        self.refresh_whitelist()
+        try:
+            init_service_environment()
+            config = verify_or_create_config()
+            self.db_conn = init_db()
 
-        self.pipeline = TwoTierPipeline(handle_event)
-        self.monitor = ProcessMonitor(lambda p: self.pipeline.push(0, "created", p))
-        self.monitor.start()
-        log_wmi("ActiveDefense 客户端适配层已启动。")
+            scoring = ScoringEngine(self.db_conn, config, self.whitelist)
+            self.attribution = AttributionEngine()
+
+            def handle_event(proc_info):
+                if self.whitelist.allows(proc_info):
+                    return
+                fp = scoring.compute_fingerprint(proc_info)
+                cursor = self.db_conn.cursor()
+                cursor.execute("SELECT 1 FROM block_rules WHERE fingerprint = ?", (fp,))
+                if cursor.fetchone():
+                    log_block(f"命中持久化阻断规则！立即终止/拦截新实例 PID {proc_info.get('pid')}")
+                    try:
+                        process = psutil.Process(proc_info.get('pid'))
+                        if process.create_time() != proc_info.get('create_time'):
+                            return
+                        process.terminate()
+                    except Exception:
+                        pass
+                    return
+                scoring.evaluate(proc_info, "system_write")
+                try:
+                    ad_queue.put_nowait(('file_event', proc_info.get('name'), 'system_write'))
+                except queue.Full:
+                    pass
+
+            self.pipeline = TwoTierPipeline(handle_event)
+            self.monitor = ProcessMonitor(lambda p: self.pipeline.push(0, "created", p))
+            self.monitor.start()
+            self.running = True
+            log_wmi("ActiveDefense 客户端适配层已启动。")
+        except Exception:
+            # Tear down partially initialized workers before reporting failure.
+            self.running = True
+            self.stop()
+            raise
 
     def stop(self):
         if not self.running:
@@ -94,7 +176,13 @@ class ActiveDefense:
         log_wmi("ActiveDefense 已停止。")
 
     def refresh_whitelist(self):
-        pass
+        from utils.whitelist import load_whitelist
+        entries = load_whitelist(strict=True, require_hashes=True)
+        if self.whitelist is None:
+            self.whitelist = WhitelistGuard(entries)
+        else:
+            self.whitelist.replace(entries)
+        return self.whitelist.snapshot_id
 
 
 # ---- 模块日志前缀 ----
@@ -326,14 +414,17 @@ class ProcessMonitor:
 
     def _async_fill_cmdline(self, pid, ppid, name):
         cmdline = "cmdline_unknown"
+        created = None
         try:
             p = psutil.Process(pid)
+            created = p.create_time()
             cmdline = " ".join(p.cmdline())
         except Exception:
             pass
         
         proc_info = {
             "pid": pid,
+            "create_time": created,
             "ppid": ppid,
             "name": name,
             "cmdline": cmdline,
@@ -355,6 +446,7 @@ class ProcessMonitor:
                 for pid in missing_pids:
                     try:
                         p = psutil.Process(pid)
+                        created = p.create_time()
                         name = p.name()
                         ppid = p.ppid()
                         try:
@@ -364,6 +456,7 @@ class ProcessMonitor:
                         
                         proc_info = {
                             "pid": pid,
+                            "create_time": created,
                             "ppid": ppid,
                             "name": name,
                             "cmdline": cmdline,
@@ -434,7 +527,8 @@ class AttributionEngine:
 
 # ---- P3: 行为级积分 + 滑动窗口 + 动作阶梯 ----
 class ScoringEngine:
-    def __init__(self, db_conn, config):
+    def __init__(self, db_conn, config, whitelist=None):
+        self.whitelist = whitelist
         self.conn = db_conn
         self.config = config
         self.lock = threading.Lock()
@@ -446,6 +540,10 @@ class ScoringEngine:
         return hashlib.sha256(f"{path}:{norm_cmd}".encode('utf-8')).hexdigest()[:16]
 
     def evaluate(self, proc_info, action_type):
+        if self.whitelist is None:
+            raise RuntimeError("No whitelist loaded; enforcement is disabled")
+        if self.whitelist.allows(proc_info):
+            return
         fingerprint = self.compute_fingerprint(proc_info)
         weights = self.config.get("weights", {})
         base_score = weights.get(action_type, 10)
@@ -496,9 +594,15 @@ class ScoringEngine:
             self.enforce_block(proc_info, fingerprint)
 
     def enforce_block(self, proc_info, fingerprint):
+        if self.whitelist is None:
+            raise RuntimeError("No whitelist loaded; enforcement is disabled")
+        if self.whitelist.allows(proc_info):
+            return
         pid = proc_info.get("pid")
         try:
             p = psutil.Process(pid)
+            if p.create_time() != proc_info.get('create_time'):
+                return
             p.suspend()
             log_block(f"成功挂起进程 PID {pid}")
         except Exception as e:
@@ -521,6 +625,8 @@ class VirusWiseService(win32serviceutil.ServiceFramework):
         win32serviceutil.ServiceFramework.__init__(self, args)
         self.stop_event = win32event.CreateEvent(None, 0, 0, None)
         self.is_running = True
+        self.baseline_args = tuple(args)
+        self.whitelist = None
 
     def SvcStop(self):
         self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
@@ -528,23 +634,32 @@ class VirusWiseService(win32serviceutil.ServiceFramework):
         self.is_running = False
 
     def SvcDoRun(self):
+        monitor = attribution = pipeline = db_conn = None
         try:
             check_localsystem()
+            # Fail before initializing storage/workers if no valid SCM snapshot
+            # was supplied. Never blindly load a LocalSystem profile baseline.
+            self.whitelist = _baseline_from_service_args(self.baseline_args)
             init_service_environment()
             config = verify_or_create_config()
             db_conn = init_db()
             
-            scoring = ScoringEngine(db_conn, config)
+            scoring = ScoringEngine(db_conn, config, self.whitelist)
             attribution = AttributionEngine()
             
             def handle_event(proc_info):
+                if self.whitelist.allows(proc_info):
+                    return
                 fp = scoring.compute_fingerprint(proc_info)
                 cursor = db_conn.cursor()
                 cursor.execute("SELECT 1 FROM block_rules WHERE fingerprint = ?", (fp,))
                 if cursor.fetchone():
                     log_block(f"命中持久化阻断规则！立即终止/拦截新实例 PID {proc_info.get('pid')}")
                     try:
-                        psutil.Process(proc_info.get('pid')).terminate()
+                        process = psutil.Process(proc_info.get('pid'))
+                        if process.create_time() != proc_info.get('create_time'):
+                            return
+                        process.terminate()
                     except Exception:
                         pass
                     return
@@ -562,14 +677,21 @@ class VirusWiseService(win32serviceutil.ServiceFramework):
                 if rc == win32event.WAIT_OBJECT_0:
                     break
 
-            monitor.stop()
-            attribution.stop()
-            pipeline.stop()
-            db_conn.close()
-        except Exception as e:
-            with open(os.path.join(SERVICE_DIR, "service_crash.log"), "w", encoding="utf-8") as f:
-                f.write(traceback.format_exc())
-            sys.exit(1)
+        except Exception:
+            # Invalid handoff may precede directory initialization. Do not create
+            # profile storage just to log, and do not leave enforcement workers.
+            try:
+                servicemanager.LogErrorMsg(traceback.format_exc())
+            except Exception:
+                pass
+            raise
+        finally:
+            self.is_running = False
+            for worker in (monitor, attribution, pipeline):
+                if worker is not None:
+                    worker.stop()
+            if db_conn is not None:
+                db_conn.close()
 
 
 if __name__ == '__main__':

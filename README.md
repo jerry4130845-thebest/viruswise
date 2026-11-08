@@ -86,7 +86,7 @@ Run python main.py to launch the graphical interface:
 
 #### Command-Line Usage
 
-The GUI still starts with `python main.py`; active defense is controlled in its settings. For AI or subprocess automation, use the separate [CLI entry point](<cli.py>) with [read-only diagnostics](<core/diagnostics.py>). Phase one implements only `capabilities` and `doctor`, using the Python standard library; GUI dependencies and administrator privileges are not required for these commands.
+The GUI still starts with `python main.py`. Automation uses the independent [CLI entry point](<cli.py>), [shared scanner](<core/scanning.py>), and [installed-service controller](<core/defense_control.py>). Help, `capabilities`, and `doctor` remain standard-library-only, without GUI startup, elevation, configuration reads, network access, or application-directory creation.
 
 Run from the project root:
 
@@ -94,52 +94,75 @@ Run from the project root:
 python -B cli.py --help
 python -B cli.py capabilities --json
 python -B cli.py doctor --json
-python -B cli.py capabilities --jsonl
+python -B cli.py defense status --json
+
+# Examples below explicitly authorize side effects; do not run against sensitive/test data casually.
+python -B cli.py scan "C:\Samples\sample.exe" --engine defender --allow-system-effects --timeout 120 --json
+python -B cli.py scan "C:\Samples" --engine virustotal --allow-network --timeout 120 --json
+python -B cli.py scan "C:\Samples\sample.exe" --engine virustotal --allow-network --allow-upload --timeout 120 --json
+python -B cli.py defense start --allow-system-effects --timeout 120 --json
+python -B cli.py defense stop --allow-system-effects --timeout 120 --json
 ~~~
 
-- `capabilities` lists implemented commands, output formats, exit codes, and limitations. It does not claim that planned scanning or testing interfaces exist.
-- `doctor` checks Python/platform information, current administrator status, dependency discoverability, and the Defender executable at the location used by the existing scanner. It does not launch the GUI, request elevation, start scans, access network services, read configuration or credentials, install dependencies, or create application directories.
-- Dependency discovery inspects only verified-local Windows directories without importing dependencies or invoking custom import hooks. Network paths, reparse paths, archives, and unverifiable locations are skipped. Windows-only checks return `unsupported` or `unchecked` on other platforms.
+**Scanning and consent**
 
-**Output contract**
+- Supply the VT key through the process environment variable `VIRUSWISE_VT_API_KEY`. CLI scanning does not read the GUI key/configuration or silently change engines. Do not place secrets in command arguments or shared logs.
+- `--allow-network` permits VT SHA256 lookup. Upload of an unlisted file additionally needs `--allow-upload` and is limited to 30 MB. Directory targets include their files and subdirectories. Uploaded content may be shared with third parties; hash lookup also discloses a file identifier.
+- Defender requires `--allow-system-effects` because Windows Defender may remediate files and use its own cloud/network policy. No network probe is used to silently choose an engine. Client exit zero is execution evidence, **not proof that files are clean**; verify detections/remediation in Windows Security.
+- GUI file/folder scanning reuses the same scanner, preserving per-task upload consent, sensitivity and scan IDs. GUI supplies its existing whitelist; CLI does not silently load it for scanning. Whitelist-skipped files remain unscanned, not certified safe. GUI VT task budget defaults to 7200 seconds; CLI defaults to 120.
 
-- The default output and `--json` produce one final JSON object. `--jsonl` produces JSON events; phase one emits only the final event with `"event":"result"`. The two flags are mutually exclusive.
-- Responses contain `schema_version` (currently `"1.0"`), `request_id`, `command`, `status`, `result`, and `errors`. Each error includes `code`, `message`, and `next_action`. Parse the structured fields rather than matching human-readable messages.
-- Plain `--help` prints text; adding `--json` or `--jsonl` wraps help in the corresponding response format. Machine output is not mixed with human logs.
+**Active defense and the one-hour whitelist rule**
+
+- Only the already-installed `VirusWiseActiveDefense` Windows service can be queried/started/stopped. There is no implicit installation, elevation, restart, or communication with an existing GUI. `defense status` is read-only, but unlike `doctor` it reads local baseline metadata. Stop does not record a new whitelist.
+- Before **non-GUI `defense start`**, reuse a readable valid whitelist only when `0 <= now - last_whitelist_recorded_at <= 3600` seconds. A missing/corrupt baseline, absent/malformed/future/expired timestamp, or mismatched saved snapshot requires a new recording lasting **at least 30 seconds**. Exactly one hour is still valid.
+- The recorder enumerates and hashes real running executables. Keep the machine in a known-clean state and do not launch test programs during recording. Individual inaccessible processes are reported, not silently declared safe; failure to enumerate or hash any executable blocks completion. Successful whitelist persistence and readback precede recording the success timestamp and snapshot identity in config.
+- Failed/cancelled/timed-out recording or save does not advance the success timestamp and does not permit service startup/tests. A whitelist write can already have occurred before a later config save fails; it is not treated as a successful recording. Ordinary GUI settings saves preserve recording metadata. GUI manual recording updates it but **does not enforce hourly freshness**.
+- If the service is already active with a stale baseline, startup refuses to learn under active enforcement; explicitly stop it first. There is no automatic stop/restart. A bounded snapshot is handed through SCM startup arguments, not the LocalSystem profile; an oversized snapshot is refused.
+- **SCM RUNNING is not a whitelist-loaded acknowledgement.** Start currently returns `ready=false` / `readiness_unconfirmed` (exit 6) even when Windows accepted startup. Status likewise never certifies protection. Do not use these results to authorize destructive tests. The updated service requires a valid startup snapshot; legacy/no-argument service startup is refused rather than silently using another account's whitelist. Older installed service code may ignore startup arguments and must not be assumed compatible.
+- Current active defense has no enabled directory watcher (`WATCHDOG_AVAILABLE=False`); `monitor_dirs` does not implement file monitoring. Process enforcement consults the loaded whitelist before block-rule termination or scoring/suspension. This is not a promise of comprehensive file protection.
+
+**Output, deadlines, and limitations**
+
+- Default output / `--json`: one final JSON object. `--jsonl`: currently only one final event with `"event":"result"`, not streaming progress. The flags are mutually exclusive. Plain help is text; machine-format help uses the response envelope.
+- Envelope: `schema_version` (`"1.0"`), `request_id`, `command`, `status`, `result`, `errors`. Errors include `code`, `message`, `next_action`. Inspect per-file verdicts, service state and `ready`, not just the outer status or exit code. Unknown/pending/partial/unscanned is never equivalent to clean.
+- `--timeout` is a positive finite **cooperative operation budget**, not a hard wall-clock deadline. VT requests have connect/read inactivity bounds; hashing, filesystem/SCM calls and in-flight requests may exceed the budget before the next check. Expired baseline recording needs more than 30 seconds of available budget. Cancellation/timeout does not roll back saved data, uploads, remediation or a requested service transition. Stopping the Defender client does not prove its system service stopped scanning.
+- `doctor` performs local-only dependency discovery, not dependency imports or runtime health tests. Network/reparse/archive/unverifiable search locations are skipped. `discoverable` and executable `present` are not readiness findings. Unsupported/unverified checks remain explicit.
+- No test execution, cleanup command or GUI IPC is implemented; `test` returns unavailable. Initialization/output interruption can leave no complete response. The [plan](<plan.md>) includes future work, not guaranteed implemented capabilities.
 
 | Exit code | Meaning |
 | --- | --- |
-| 0 | Command completed; inspect diagnostic findings, not just the exit code |
-| 2 | Missing, unknown, or conflicting arguments |
-| 3 | Requested capability or required CLI module unavailable |
-| 5 | Execution or output failure |
-| 130 | Cancelled by interruption |
-| 4 / 6 / 124 | Reserved for authorization failure / partial or unconfirmed execution / timeout; not implemented in phase one |
-
-**Interpretation and limits**
-
-`discoverable` means a dependency candidate was found, not that it imports or works correctly. `present` means the Defender executable exists, not that its service is ready. Missing or unverified observations are reported as `unavailable`, `unchecked`, or `unsupported`. An optional dependency finding does not itself make `doctor` fail; exit `0` and `status=completed` do not certify engine health, file safety, or effective protection.
-
-Scanning, test execution, cleanup, and communication with a running GUI are not implemented. There is **no hard timeout** (`timeout_supported=false`); `124` is reserved, not an implemented timeout guarantee. Ctrl+C during diagnostics is handled as cancellation, but interruption during initialization or output may leave no complete JSON response. The broader [implementation plan](<plan.md>) describes future work, not currently available commands.
+| 0 | Command completed; not a clean-file or protection certificate |
+| 2 | Missing, invalid or conflicting arguments |
+| 3 | Capability, platform, installed service or dependency unavailable |
+| 4 | Explicit authorization or operating-system permission missing |
+| 5 | Execution, persistence or output failure |
+| 6 | Partial or unconfirmed result, including unacknowledged service readiness |
+| 124 | Cooperative operation budget expired, not a hard I/O timeout guarantee |
+| 130 | Cancelled/interrupted |
 
 #### Configuration
-Edit utils/config.txt or use the GUI:
-apikey=Your_VirusTotal_Key
-sensitive=False
-auto_process=False
-virustotal=True
-windows_defender=False
-windows_defender_offline_only=True
-windows_defender_force=False
-ad_enabled=False
-delete_protection=True
+Prefer the GUI for preferences. The [configuration loader](<utils/config.py>) resolves the data directory lazily. Boolean values in the text format are `1`/`0`; monitored paths are separated by `|`. CLI scans do not read this GUI API key. The final two fields below are maintained together by successful recording; leave them empty before the first recording, and do not fabricate or manually advance them. A missing or mismatched snapshot identity also requires re-recording.
+
+~~~ini
+apikey=
+sensitive=0
+auto_process=0
+virustotal=1
+windows_defender=0
+windows_defender_offline_only=1
+windows_defender_force=0
+ad_enabled=0
+delete_protection=1
 batch_delete_threshold=5
-modify_protection=True
-monitor_dirs=C|/path/to/monitor
-wl_by_name=False
-wl_by_hash=True
-ad_warned_on_enable=False
+modify_protection=1
+monitor_dirs=C:/example/one|D:/example/two
+wl_by_name=0
+wl_by_hash=1
+ad_warned_on_enable=0
 theme=default
+last_whitelist_recorded_at=
+last_whitelist_snapshot_id=
+~~~
 
 ### Protection Levels
 The system uses a multi-tiered scoring approach:
@@ -252,60 +275,83 @@ VirusWise 是一个基于 Python 的主动防御安全平台，旨在实时检�
 
 #### 命令行使用
 
-GUI 仍通过 `python main.py` 启动，主动防御在 GUI 设置中控制。AI 或子进程自动化请使用独立的 [CLI 入口](<cli.py>)及[只读诊断模块](<core/diagnostics.py>)。阶段一仅实现 `capabilities` 和 `doctor`，使用 Python 标准库；执行这些命令不要求安装 GUI 依赖或拥有管理员权限。
+GUI 仍通过 `python main.py` 启动。自动化使用独立的 [CLI 入口](<cli.py>)、[共享扫描器](<core/scanning.py>)和[已安装服务控制器](<core/defense_control.py>)。帮助、`capabilities` 和 `doctor` 仍仅依赖标准库，不启动 GUI、不提权、不读配置、不联网，也不创建应用数据目录。
 
-在项目根目录运行：
+在项目根目录执行：
 
 ~~~text
 python -B cli.py --help
 python -B cli.py capabilities --json
 python -B cli.py doctor --json
-python -B cli.py capabilities --jsonl
+python -B cli.py defense status --json
+
+# 以下示例明确授权副作用，请勿随意针对敏感数据或测试样本执行。
+python -B cli.py scan "C:\Samples\sample.exe" --engine defender --allow-system-effects --timeout 120 --json
+python -B cli.py scan "C:\Samples" --engine virustotal --allow-network --timeout 120 --json
+python -B cli.py scan "C:\Samples\sample.exe" --engine virustotal --allow-network --allow-upload --timeout 120 --json
+python -B cli.py defense start --allow-system-effects --timeout 120 --json
+python -B cli.py defense stop --allow-system-effects --timeout 120 --json
 ~~~
 
-- `capabilities`：列出已实现命令、输出格式、退出码和限制，不将计划中的扫描或测试接口标为可用。
-- `doctor`：检查 Python/系统信息、当前管理员状态、依赖可发现性，以及现有扫描器所用位置的 Defender 程序文件。不会启动 GUI、请求提权、执行扫描、访问网络服务、读取配置或密钥、安装依赖或创建业务目录。
-- 依赖检查仅查看已确认的 Windows 本地目录，不导入依赖模块、不调用自定义导入钩子；跳过网络路径、重解析路径、归档文件及无法确认的位置。在其他平台上，Windows 专属检查返回 `unsupported` 或 `unchecked`。
+**扫描与授权**
 
-**输出契约**
+- VT 密钥通过进程环境变量 `VIRUSWISE_VT_API_KEY` 提供。CLI 不读取 GUI 密钥／配置，不自动切换引擎；不要把密钥放进命令行参数或共享日志。
+- `--allow-network` 允许向 VT 查询 SHA256；未收录文件的完整上传还必须有 `--allow-upload`，大小限制 30 MB。目录目标包括其文件和子目录。上传内容可能与第三方共享，哈希查询也会披露文件标识。
+- Defender 必须显式传入 `--allow-system-effects`：Windows Defender 自身可能处置文件并按系统策略使用云端／网络。显式选择引擎不会触发自动联网探测。客户端返回 0 **不等于无毒**，检测和处置结果应到 Windows 安全中心确认。
+- GUI 单文件／文件夹扫描复用同一实现，保留任务级上传授权、敏感模式与扫描编号。GUI 仍提供已有白名单；CLI 扫描不暗中加载它。白名单跳过是“未扫描”，不是安全认证。GUI VT 任务默认预算 7200 秒；CLI 默认 120 秒。
 
-- 默认输出及 `--json` 均为一个最终 JSON 对象。`--jsonl` 输出 JSON 事件，阶段一仅输出带 `"event":"result"` 的最终事件；两个选项互斥。
-- 响应固定包含 `schema_version`（当前为 `"1.0"`）、`request_id`、`command`、`status`、`result` 和 `errors`。每个错误包含 `code`、`message` 和 `next_action`；调用方应解析结构化字段，不匹配人类可读提示文本。
-- 单独使用 `--help` 输出文本；搭配 `--json` 或 `--jsonl` 则将帮助放入对应格式的响应中。机器输出不混入人类日志。
+**主动防御与一小时白名单规则**
+
+- 仅控制已安装的 `VirusWiseActiveDefense` Windows 服务；不自动安装、提权、重启，也不控制正在运行的 GUI。`defense status` 只读，但与 `doctor` 不同，它会读取本地基线元数据。停止服务不需要重新记录白名单。
+- **非 GUI 的 `defense start` 调用前**，只有白名单可正常读取且 `0 <= 当前时间 - last_whitelist_recorded_at <= 3600` 秒时才复用。白名单缺失／损坏、时间缺失／格式错误／在未来／过期，或已保存快照不匹配，必须重新记录**至少 30 秒**。恰好一小时仍有效。
+- 记录器真实枚举运行进程并计算可执行文件哈希。请在已知干净的环境记录，期间不要启动测试程序。个别进程无法读取会报告，不能当作安全；枚举失败或一个可执行文件也无法计算哈希时不算完成。白名单保存并回读验证成功后，才向配置提交成功时间与快照标识。
+- 失败、取消、超时或保存失败不推进成功时间，也不放行服务启动／测试。后续配置保存失败前，白名单文件可能已经写入，但仍不算成功记录。普通 GUI 设置保存会保留记录元数据。GUI 手动记录同样更新成功时间，**不强制执行一小时时效检查**。
+- 服务已经运行但基线过期时，拒绝在防御执行期间学习；需要显式停止后重试，不自动停启。有大小上限的快照通过 SCM 启动参数交付，而不是让 LocalSystem 读取自己的用户目录；超大快照会拒绝启动。
+- **SCM 的 RUNNING 不证明已加载本次白名单。** 即使 Windows 接受启动，目前仍返回 `ready=false`／`readiness_unconfirmed`（退出码 6）；状态查询同样不认证防护就绪，不能据此执行破坏性测试。更新后的服务要求有效启动快照，旧式／不带参数的启动会被拒绝，而非悄悄使用另一账户的白名单。旧版已安装服务可能忽略参数，不能假定兼容。
+- 当前主动防御没有启用目录监听（`WATCHDOG_AVAILABLE=False`）；`monitor_dirs` 并未实现文件监控。进程阻止规则终止以及评分／挂起前会检查已加载的白名单；这不代表具备完整文件防护。
+
+**输出、超时与边界**
+
+- 默认／`--json` 输出一个最终 JSON 对象；`--jsonl` 当前也只输出最终的 `"event":"result"` 事件，并非实时进度流。两者互斥。普通帮助是文本，机器格式帮助使用统一信封。
+- 信封包含 `schema_version`（`"1.0"`）、`request_id`、`command`、`status`、`result`、`errors`；错误包含 `code`、`message`、`next_action`。必须检查逐文件判定、服务状态和 `ready`，不能仅看外层状态或退出码。未知／待定／部分完成／未扫描均不等于安全。
+- `--timeout` 是正有限数，表示**协作式任务预算，不是硬墙钟截止时间**。VT 单次请求有连接／读取空闲超时；哈希、文件系统、SCM 和正在进行的请求可能超过预算后才能检查。过期基线记录需要超过 30 秒的剩余预算。取消／超时不回滚已保存数据、上传、处置或已发出的服务状态变更；结束 Defender 客户端也不证明系统服务已停止扫描。
+- `doctor` 只做本地依赖发现，不导入依赖，也不验证实际运行健康；跳过网络、重解析、归档和不可确认的搜索位置。`discoverable` 与可执行文件 `present` 不代表就绪。不支持／无法确认的检查会明确标记。
+- 未实现测试执行、清理命令或 GUI IPC；`test` 返回不可用。初始化／输出期间中断可能没有完整响应。[实施计划](<plan.md>)还包含未来工作，不代表全部接口已实现。
 
 | 退出码 | 含义 |
 | --- | --- |
-| 0 | 命令执行完成；仍须检查诊断结果，不能只看退出码 |
-| 2 | 参数缺失、未知或冲突 |
-| 3 | 请求的能力或 CLI 必需模块不可用 |
-| 5 | 执行或输出故障 |
-| 130 | 因中断而取消 |
-| 4 / 6 / 124 | 分别预留给授权不足、部分完成或待确认、超时；阶段一尚未实现 |
-
-**结果解释与限制**
-
-`discoverable` 仅表示发现了依赖候选，不证明它能导入或正常工作；`present` 仅表示 Defender 程序文件存在，不证明服务已就绪。缺失或无法确认的检查项返回 `unavailable`、`unchecked` 或 `unsupported`。可选依赖的诊断发现本身不会让 `doctor` 执行失败；退出码 `0` 和 `status=completed` 不代表引擎健康、文件安全或防护有效。
-
-扫描、测试执行、清理及与运行中 GUI 的通信均未实现。当前**没有硬超时**（`timeout_supported=false`），`124` 只是预留退出码，不是已实现的超时保证。诊断过程中的 Ctrl+C 会按取消处理，但初始化或输出期间中断可能无法得到完整 JSON 响应。[实施计划](<plan.md>)描述的是后续工作，不代表相关命令已经可用。
+| 0 | 命令完成，不是无毒／防护有效证明 |
+| 2 | 参数缺失、无效或冲突 |
+| 3 | 能力、平台、已安装服务或依赖不可用 |
+| 4 | 缺少显式授权或操作系统权限 |
+| 5 | 执行、持久化或输出失败 |
+| 6 | 部分完成或结果未确认，包括未得到服务就绪确认 |
+| 124 | 协作式任务预算耗尽，不是硬 I/O 超时保证 |
+| 130 | 取消／中断 |
 
 #### 配置
-编辑 utils/config.txt 或使用 GUI:
-apikey=你的_VirusTotal_Key
-sensitive=False
-auto_process=False
-virustotal=True
-windows_defender=False
-windows_defender_offline_only=True
-windows_defender_force=False
-ad_enabled=False
-delete_protection=True
+建议通过 GUI 修改偏好。[配置模块](<utils/config.py>) 按运行方式延迟定位数据目录。文本格式的布尔值使用 `1`/`0`，监控路径以 `|` 分隔。CLI 扫描不读取这里的 GUI API 密钥。下面最后两个字段由成功记录一并维护；首次记录前留空，不要伪造或手动推进时间。快照标识缺失或不匹配也会要求重新记录。
+
+~~~ini
+apikey=
+sensitive=0
+auto_process=0
+virustotal=1
+windows_defender=0
+windows_defender_offline_only=1
+windows_defender_force=0
+ad_enabled=0
+delete_protection=1
 batch_delete_threshold=5
-modify_protection=True
-monitor_dirs=C|/path/to/monitor
-wl_by_name=False
-wl_by_hash=True
-ad_warned_on_enable=False
+modify_protection=1
+monitor_dirs=C:/example/one|D:/example/two
+wl_by_name=0
+wl_by_hash=1
+ad_warned_on_enable=0
 theme=default
+last_whitelist_recorded_at=
+last_whitelist_snapshot_id=
+~~~
 
 ### 保护级别
 系统使用多层评分方法：
