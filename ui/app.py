@@ -37,17 +37,28 @@ API_KEY = ""
 
 def record_processes_for_30_seconds():
     from core.whitelist_recording import record_whitelist
+    from core.defense_control import require_service_stopped
+
+    def recording_guard():
+        require_service_stopped(allow_not_installed=True)
     app = getattr(sys, 'app', None)
     if app is None or getattr(app, '_closing', False):
         return
     if getattr(app, '_record_cancel', None) is not None:
         main_log('白名单记录已在进行中')
         return
+    try:
+        recording_guard()
+    except Exception as exc:
+        main_log(f"无法确认 Windows 防御服务已停止，拒绝记录白名单: {exc}")
+        messagebox.showwarning("无法记录白名单", "请先停止 Windows 防御服务；服务状态未知或无查询权限时不能学习白名单。")
+        return
     cancel = threading.Event()
     app._record_cancel = cancel
     ad_was_running = bool(app.ad and app.ad.running)
-    if ad_was_running:
+    if app.ad is not None:
         try:
+            # A previous stop may have timed out with running=False but live workers.
             app.ad.stop()
         except Exception:
             app._record_cancel = None
@@ -88,7 +99,7 @@ def record_processes_for_30_seconds():
 
     def record():
         # GUI manual recording updates the shared timestamp but has no hourly gate.
-        result = record_whitelist(cancel_event=cancel)
+        result = record_whitelist(cancel_event=cancel, guard=recording_guard)
         try:
             app.after(0, lambda: finish(result))
         except (RuntimeError, tk.TclError):
@@ -145,8 +156,8 @@ class VirusWiseApp(ctk.CTk):
         if admod.ACTIVE_DEFENSE_ENABLED and watchdog_available:
             self.after(1000, self._delayed_start_active_defense)
         elif admod.ACTIVE_DEFENSE_ENABLED and not watchdog_available:
-            main_log("警告: watchdog模块未安装，主动防御已禁用")
-            messagebox.showwarning("警告", "watchdog模块未安装，主动防御功能不可用。")
+            main_log("警告: 当前防御核心尚未实现 GUI 目录监控，GUI 主动防御未启动")
+            messagebox.showwarning("主动防御未启动", "当前防御核心尚未实现 GUI 目录监控。\n这不是 watchdog 安装检测结果；安装依赖不能解除此限制。")
 
     def _build_ui(self):
         self.nav_frame = ctk.CTkFrame(self, width=150, corner_radius=0)

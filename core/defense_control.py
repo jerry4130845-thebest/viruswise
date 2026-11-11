@@ -323,9 +323,15 @@ def _baseline_summary(baseline):
     return {key: value for key, value in baseline.items() if key != 'entries'}
 
 
-def _require_stopped():
-    with _Service() as service:
-        info = service.query()
+def require_service_stopped(*, allow_not_installed=False):
+    """Recording guard: unknown/access-denied states must never permit learning."""
+    try:
+        with _Service() as service:
+            info = service.query()
+    except DefenseControlError as exc:
+        if allow_not_installed and exc.code == 'not_installed':
+            return
+        raise
     if info['service_state'] != 'stopped':
         raise DefenseControlError('baseline_refresh_requires_stop',
                                   'Cannot learn a baseline while the service is active',
@@ -384,7 +390,7 @@ def start(timeout=120, cancel_event=None, on_event=None, allow_system_effects=Fa
                 from core.whitelist_recording import record_whitelist
                 recording = record_whitelist(timeout=deadline - time.monotonic(),
                                              cancel_event=cancel_event, on_event=on_event,
-                                             guard=_require_stopped)
+                                             guard=require_service_stopped)
                 if not recording['ok']:
                     return dict(recording, ready=False, start_requested=False,
                                 next_action='Resolve recording failure before starting defense')

@@ -98,6 +98,73 @@ def _error(code, exit_code, message):
                               exit_code=exit_code, error=message))
 
 
+def _install_elevated():
+    """Wait for one UAC child; only its exit status crosses the privilege boundary."""
+    process = None
+    launched = False
+    try:
+        import win32api
+        import win32event
+        import win32process
+        from win32com.shell import shell, shellcon
+
+        args = ["--install", "--elevated-install"]
+        if not getattr(sys, "frozen", False):
+            args.insert(0, ENTRY_SCRIPT)
+        info = shell.ShellExecuteEx(
+            fMask=shellcon.SEE_MASK_NOCLOSEPROCESS,
+            lpVerb="runas", lpFile=sys.executable,
+            lpParameters=subprocess.list2cmdline(args),
+            lpDirectory=PROJECT_ROOT, nShow=1)
+        launched = True
+        process = info.get("hProcess")
+        if not process:
+            return _error("elevation_wait_failed", 5,
+                          "UAC launch returned no process handle; installation outcome is unknown. "
+                          "Inspect service state before retrying; no service start was requested.")
+        # Bounded waits allow Ctrl+C without terminating an elevated installer midway.
+        while True:
+            status = win32event.WaitForSingleObject(process, 200)
+            if status == win32event.WAIT_OBJECT_0:
+                break
+            if status != win32event.WAIT_TIMEOUT:
+                raise RuntimeError("Unexpected process wait result: %s" % status)
+        exit_code = win32process.GetExitCodeProcess(process)
+        return _write_result(dict(
+            ok=exit_code == 0, ready=False,
+            code="elevated_child_exited", exit_code=exit_code,
+            child_exit_code=exit_code, evidence="child_exit_code_only",
+            message="Elevated installer exited with code %s. "
+                    "Its controller JSON was not captured: this does not independently verify "
+                    "installation or service readiness. No service start was requested." % exit_code))
+    except ImportError:
+        return _error("dependency_missing", 3,
+                      "pywin32 ShellExecuteEx and process waiting are required for install elevation.")
+    except KeyboardInterrupt:
+        return _error("cancelled", 130,
+                      "Waiting for UAC/installation was interrupted; an elevated child may still run. "
+                      "Inspect service state before retrying; no service start was requested.")
+    except Exception as exc:
+        winerror = getattr(exc, "winerror", None)
+        if winerror is None and exc.args and isinstance(exc.args[0], int):
+            winerror = exc.args[0]
+        if not launched and winerror == 1223:
+            return _error("elevation_cancelled", 1223,
+                          "Windows UAC was cancelled; the elevated installer was not started.")
+        return _error("elevation_wait_failed" if launched else "elevation_failed", 5,
+                      ("Unable to confirm elevated installer completion; installation outcome is unknown. "
+                       "Inspect service state before retrying. " if launched else
+                       "Unable to launch the elevated installer. ") +
+                      "Windows error: %s. No service start was requested." % winerror)
+    finally:
+        if process:
+            try:
+                win32api.CloseHandle(process)
+            except Exception:
+                # Do not replace the child's exit status with a cleanup error.
+                pass
+
+
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
@@ -109,10 +176,14 @@ def main(argv=None):
     if args in (["--help"], ["-h"]):
         print("VirusWise [--install | --uninstall | --cli <arguments> | --help]\n"
               "No arguments: GUI. --install/--uninstall: explicit administrator operations,\n"
-              "JSON controller results; no automatic elevation or service start.\n"
+              "JSON results; --install requests Windows UAC when needed and waits for completion.\n"
+              "--uninstall never elevates automatically. Neither operation starts the service.\n"
               "--cli: existing automation CLI (try --cli --help).\n"
               "--service: internal Windows SCM host, not a manual defense start command.")
         return 0
+    elevated_install = args == ["--install", "--elevated-install"]
+    if elevated_install:
+        args = ["--install"]
     if len(args) != 1 or args[0] not in ("--install", "--uninstall", "--service"):
         return _error("invalid_arguments", 2,
                       "Choose one mode; --install, --uninstall and --service accept no extra arguments.")
@@ -123,6 +194,11 @@ def main(argv=None):
             from core.active_defense import run_service_host
             run_service_host()
             return 0
+        if args[0] == "--install" and not is_admin():
+            if elevated_install:
+                return _error("elevation_failed", 4,
+                              "Elevated installer still lacks administrator rights; refusing another UAC request.")
+            return _install_elevated()
         from core import defense_control
         action = defense_control.install if args[0] == "--install" else defense_control.uninstall
         return _write_result(action(allow_system_effects=True))

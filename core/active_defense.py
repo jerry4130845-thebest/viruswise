@@ -9,6 +9,9 @@ import hashlib
 import json
 from datetime import datetime, timedelta
 import queue
+import itertools
+import math
+from collections import deque
 import win32serviceutil
 import win32service
 import win32event
@@ -102,6 +105,38 @@ def _baseline_from_service_args(args):
     return WhitelistGuard(entries)
 
 
+def observe_process_creation(proc_info):
+    # Creation is not file-write evidence. Legacy block_rules have no reliable
+    # provenance (the old adapter scored creation as system_write); retain them
+    # for inspection, but never replay them against a newly created process.
+    log_wmi(f"Observed process creation PID {proc_info.get('pid')}; no enforcement")
+
+
+def _join_threads(threads, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    for thread in threads:
+        if thread.ident is not None and thread is not threading.current_thread():
+            thread.join(max(0.0, deadline - time.monotonic()))
+    if any(thread.is_alive() for thread in threads):
+        raise TimeoutError("Defense workers did not stop; database must remain open")
+
+
+def _stop_workers(workers):
+    workers = [worker for worker in workers if worker is not None]
+    # Signal every producer/consumer before waiting, even if one join times out.
+    for worker in workers:
+        worker.running = False
+        worker.stop_event.set()
+    failures = []
+    for worker in workers:
+        try:
+            worker.stop()
+        except Exception as exc:
+            failures.append(exc)
+    if failures:
+        raise RuntimeError("Defense shutdown incomplete; database left open") from failures[0]
+
+
 class ActiveDefense:
     def __init__(self):
         self.running = False
@@ -114,6 +149,8 @@ class ActiveDefense:
     def start(self, monitor_dirs=None):
         if self.running:
             return
+        if self.db_conn is not None:
+            raise RuntimeError("Previous defense shutdown is incomplete")
         # GUI intentionally has no hourly recording policy. A readable hashed
         # baseline is still mandatory before any enforcement worker starts.
         self.refresh_whitelist()
@@ -126,32 +163,13 @@ class ActiveDefense:
             self.attribution = AttributionEngine()
 
             def handle_event(proc_info):
-                if self.whitelist.allows(proc_info):
-                    return
-                fp = scoring.compute_fingerprint(proc_info)
-                cursor = self.db_conn.cursor()
-                cursor.execute("SELECT 1 FROM block_rules WHERE fingerprint = ?", (fp,))
-                if cursor.fetchone():
-                    log_block(f"命中持久化阻断规则！立即终止/拦截新实例 PID {proc_info.get('pid')}")
-                    try:
-                        process = psutil.Process(proc_info.get('pid'))
-                        if process.create_time() != proc_info.get('create_time'):
-                            return
-                        process.terminate()
-                    except Exception:
-                        pass
-                    return
-                scoring.evaluate(proc_info, "system_write")
-                try:
-                    ad_queue.put_nowait(('file_event', proc_info.get('name'), 'system_write'))
-                except queue.Full:
-                    pass
+                observe_process_creation(proc_info)
 
             self.pipeline = TwoTierPipeline(handle_event)
             self.monitor = ProcessMonitor(lambda p: self.pipeline.push(0, "created", p))
             self.monitor.start()
             self.running = True
-            log_wmi("ActiveDefense 客户端适配层已启动。")
+            log_wmi("ActiveDefense 进程观察已启动；文件行为监控未实现，当前不执行自动阻断。")
         except Exception:
             # Tear down partially initialized workers before reporting failure.
             self.running = True
@@ -159,20 +177,11 @@ class ActiveDefense:
             raise
 
     def stop(self):
-        if not self.running:
-            return
         self.running = False
-        if self.monitor:
-            self.monitor.stop()
-        if self.attribution:
-            self.attribution.stop()
-        if self.pipeline:
-            self.pipeline.stop()
-        if self.db_conn:
-            try:
-                self.db_conn.close()
-            except Exception:
-                pass
+        _stop_workers((self.monitor, self.attribution, self.pipeline))
+        if self.db_conn is not None:
+            self.db_conn.close()
+            self.db_conn = None
         log_wmi("ActiveDefense 已停止。")
 
     def refresh_whitelist(self):
@@ -282,11 +291,11 @@ def verify_or_create_config():
             calc_hmac = hmac.new(HMAC_KEY, cfg_bytes, hashlib.sha256).hexdigest()
             if not hmac.compare_digest(calc_hmac, stored_hmac):
                 log_block("核心配置 HMAC 校验失败！配置被篡改，拒绝启动。")
-                sys.exit(1)
+                raise ValueError("Core configuration HMAC validation failed")
             return cfg_data
         except Exception as e:
             log_block(f"核心配置解析失败: {e}")
-            sys.exit(1)
+            raise ValueError("Invalid core configuration") from e
     return default_config
 
 def init_db():
@@ -312,15 +321,19 @@ class TwoTierPipeline:
     def __init__(self, worker_callback):
         self.ring_buffer = queue.Queue(maxsize=100000)
         self.high_queue = queue.PriorityQueue(maxsize=10000)
+        self.sequence = itertools.count()
         self.low_queue = queue.Queue(maxsize=10000)
         self.worker_callback = worker_callback
         self.dropped_count = 0
         self.running = True
+        self.stop_event = threading.Event()
         
         self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker_thread.start()
 
     def push(self, priority, event_type, data):
+        if not self.running:
+            return
         if self.ring_buffer.full():
             try:
                 self.ring_buffer.get_nowait()
@@ -335,7 +348,7 @@ class TwoTierPipeline:
 
         if priority == 0:
             try:
-                self.high_queue.put_nowait((0, data))
+                self.high_queue.put_nowait((0, next(self.sequence), data))
             except queue.Full:
                 self.dropped_count += 1
                 log_queue("高优先级队列满！")
@@ -350,7 +363,7 @@ class TwoTierPipeline:
         while self.running:
             try:
                 if not self.high_queue.empty():
-                    _, data = self.high_queue.get(timeout=0.05)
+                    _, _, data = self.high_queue.get(timeout=0.05)
                     self.worker_callback(data)
                     continue
                 
@@ -359,14 +372,16 @@ class TwoTierPipeline:
                     self.worker_callback(data)
                     continue
                 
-                time.sleep(0.01)
+                self.stop_event.wait(0.01)
             except queue.Empty:
                 continue
             except Exception as e:
                 log_queue(f"Worker 异常: {e}")
 
-    def stop(self):
+    def stop(self, timeout=5.0):
         self.running = False
+        self.stop_event.set()
+        _join_threads((self.worker_thread,), timeout)
 
 
 # ---- P1: WMI 进程创建监控 + 轮询兜底 ----
@@ -376,6 +391,7 @@ class ProcessMonitor:
         self.process_table = {}
         self.lock = threading.Lock()
         self.running = True
+        self.stop_event = threading.Event()
         
         self.wmi_thread = threading.Thread(target=self._wmi_listener_loop, daemon=True)
         self.fallback_thread = threading.Thread(target=self._polling_fallback_loop, daemon=True)
@@ -401,10 +417,10 @@ class ProcessMonitor:
                         ppid = int(event.ParentProcessID)
                         name = str(event.ProcessName)
                         
-                        threading.Thread(target=self._async_fill_cmdline, args=(pid, ppid, name), daemon=True).start()
+                        self._async_fill_cmdline(pid, ppid, name)
             except Exception as e:
                 log_wmi(f"WMI 订阅断开或异常: {e}, {backoff}秒后重连...")
-                time.sleep(backoff)
+                self.stop_event.wait(backoff)
                 backoff = min(backoff * 2, 30)
             finally:
                 try:
@@ -469,10 +485,12 @@ class ProcessMonitor:
                         pass
             except Exception as e:
                 log_wmi(f"轮询兜底异常: {e}")
-            time.sleep(2)
+            self.stop_event.wait(2)
 
-    def stop(self):
+    def stop(self, timeout=5.0):
         self.running = False
+        self.stop_event.set()
+        _join_threads((self.wmi_thread, self.fallback_thread), timeout)
 
 
 # ---- P2: 缓存式归因（Restart Manager + 句柄快照缓存） ----
@@ -480,6 +498,7 @@ class AttributionEngine:
     def __init__(self):
         self.handle_cache = {}
         self.running = True
+        self.stop_event = threading.Event()
         self.cache_thread = threading.Thread(target=self._snapshot_loop, daemon=True)
         self.cache_thread.start()
 
@@ -496,7 +515,7 @@ class AttributionEngine:
                 self.handle_cache = new_cache
             except Exception as e:
                 log_attrib(f"快照线程异常: {e}")
-            time.sleep(2)
+            self.stop_event.wait(2)
 
     def attribute_event(self, event_type, path):
         if event_type in ["modified", "system_write", "created"]:
@@ -521,8 +540,10 @@ class AttributionEngine:
         except Exception:
             return None
 
-    def stop(self):
+    def stop(self, timeout=5.0):
         self.running = False
+        self.stop_event.set()
+        _join_threads((self.cache_thread,), timeout)
 
 
 # ---- P3: 行为级积分 + 滑动窗口 + 动作阶梯 ----
@@ -531,6 +552,10 @@ class ScoringEngine:
         self.whitelist = whitelist
         self.conn = db_conn
         self.config = config
+        self.window_seconds = float(config.get("score_window_seconds", 60.0))
+        if not math.isfinite(self.window_seconds) or self.window_seconds <= 0:
+            raise ValueError("score_window_seconds must be finite and positive")
+        self.score_events = {}
         self.lock = threading.Lock()
 
     def compute_fingerprint(self, proc_info):
@@ -540,6 +565,10 @@ class ScoringEngine:
         return hashlib.sha256(f"{path}:{norm_cmd}".encode('utf-8')).hexdigest()[:16]
 
     def evaluate(self, proc_info, action_type):
+        if action_type not in {"delete", "modify", "system_write"}:
+            return
+        if proc_info.get("create_time") is None:
+            return
         if self.whitelist is None:
             raise RuntimeError("No whitelist loaded; enforcement is disabled")
         if self.whitelist.allows(proc_info):
@@ -564,10 +593,18 @@ class ScoringEngine:
         
         with self.lock:
             cursor = self.conn.cursor()
-            cursor.execute("SELECT score FROM fingerprints WHERE fingerprint = ?", (fingerprint,))
-            row = cursor.fetchone()
-            current_score = row[0] if row else 0.0
-            new_score = current_score + score_increment
+            now = time.monotonic()
+            cutoff = now - self.window_seconds
+            for key, events in list(self.score_events.items()):
+                while events and events[0][0] <= cutoff:
+                    events.popleft()
+                if not events:
+                    del self.score_events[key]
+            # Never carry legacy DB scores or another PID incarnation forward.
+            key = (fingerprint, proc_info['pid'], proc_info['create_time'])
+            events = self.score_events.setdefault(key, deque())
+            events.append((now, score_increment))
+            new_score = sum(value for _, value in events)
             
             cursor.execute("INSERT OR REPLACE INTO fingerprints (fingerprint, score, blocked, last_updated) VALUES (?, ?, ?, ?)",
                            (fingerprint, new_score, 1 if new_score >= 80 else 0, datetime.now()))
@@ -577,10 +614,19 @@ class ScoringEngine:
         self.action_ladder(proc_info, new_score, fingerprint)
 
     def _is_elevated(self, pid):
+        process = token = None
         try:
-            return True 
+            process = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            token = win32security.OpenProcessToken(process, win32con.TOKEN_QUERY)
+            return bool(win32security.GetTokenInformation(token, win32security.TokenElevation))
         except Exception:
+            # Access denied / exited process is not evidence of elevation.
             return False
+        finally:
+            if token is not None:
+                token.Close()
+            if process is not None:
+                process.Close()
 
     def action_ladder(self, proc_info, score, fingerprint):
         if score < 20:
@@ -648,29 +694,13 @@ class VirusWiseService(win32serviceutil.ServiceFramework):
             attribution = AttributionEngine()
             
             def handle_event(proc_info):
-                if self.whitelist.allows(proc_info):
-                    return
-                fp = scoring.compute_fingerprint(proc_info)
-                cursor = db_conn.cursor()
-                cursor.execute("SELECT 1 FROM block_rules WHERE fingerprint = ?", (fp,))
-                if cursor.fetchone():
-                    log_block(f"命中持久化阻断规则！立即终止/拦截新实例 PID {proc_info.get('pid')}")
-                    try:
-                        process = psutil.Process(proc_info.get('pid'))
-                        if process.create_time() != proc_info.get('create_time'):
-                            return
-                        process.terminate()
-                    except Exception:
-                        pass
-                    return
-                
-                scoring.evaluate(proc_info, "system_write")
+                observe_process_creation(proc_info)
 
             pipeline = TwoTierPipeline(handle_event)
             monitor = ProcessMonitor(lambda p: pipeline.push(0, "created", p))
             monitor.start()
 
-            log_wmi("VirusWise 安全服务已成功以 LocalSystem 运行，防御核心已启动。")
+            log_wmi("VirusWise 服务以 LocalSystem 运行；当前仅观察进程创建，文件行为监控未实现，不代表防御已就绪。")
 
             while self.is_running:
                 rc = win32event.WaitForSingleObject(self.stop_event, 5000)
@@ -687,9 +717,7 @@ class VirusWiseService(win32serviceutil.ServiceFramework):
             raise
         finally:
             self.is_running = False
-            for worker in (monitor, attribution, pipeline):
-                if worker is not None:
-                    worker.stop()
+            _stop_workers((monitor, attribution, pipeline))
             if db_conn is not None:
                 db_conn.close()
 
