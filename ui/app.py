@@ -132,6 +132,8 @@ class VirusWiseApp(ctk.CTk):
         self._render_generation = 0
         self._render_timer = None
         self._scan_ui_timer = None
+        self._service_ui_timer = None
+        self._service_busy = False
         self._scan_events = queue.Queue(maxsize=256)
         self._scan_cancel = threading.Event()
         self._signature_cancel = threading.Event()
@@ -336,6 +338,22 @@ class VirusWiseApp(ctk.CTk):
         ad_btn_row.pack(fill="x", pady=10)
         ctk.CTkButton(ad_btn_row, text="保存主动防御设置", command=self.save_ad).pack(side="left", padx=5)
 
+        service_frame = ctk.CTkFrame(frame)
+        service_frame.pack(fill="x", padx=10, pady=5)
+        ctk.CTkLabel(service_frame, text="Windows 防御服务", font=("Arial", 13, "bold")).pack(anchor="w", pady=(0,5))
+        self.service_status = ctk.CTkLabel(
+            service_frame, text="安装仅注册服务，不自动启动，也不代表防御已就绪；卸载要求服务已停止。",
+            wraplength=660, justify="left")
+        self.service_status.pack(anchor="w", padx=5, pady=5)
+        service_buttons = ctk.CTkFrame(service_frame)
+        service_buttons.pack(fill="x", pady=5)
+        self.install_service_btn = ctk.CTkButton(
+            service_buttons, text="安装服务", command=lambda: self._manage_windows_service("install"))
+        self.install_service_btn.pack(side="left", padx=5)
+        self.uninstall_service_btn = ctk.CTkButton(
+            service_buttons, text="卸载服务", command=lambda: self._manage_windows_service("uninstall"))
+        self.uninstall_service_btn.pack(side="left", padx=5)
+
         wl_frame = ctk.CTkFrame(frame)
         wl_frame.pack(fill="x", padx=10, pady=5)
         ctk.CTkLabel(wl_frame, text="白名单放行策略", font=("Arial", 13, "bold")).pack(anchor="w", pady=(0,5))
@@ -369,6 +387,98 @@ class VirusWiseApp(ctk.CTk):
     def record_processes_for_30_seconds(self):
         record_processes_for_30_seconds()
 
+    def _manage_windows_service(self, action):
+        if action not in ("install", "uninstall") or self._closing or self._service_busy:
+            return
+        label = "安装" if action == "install" else "卸载"
+        prompt = ("是否安装当前程序的 Windows 防御服务？\n仅注册服务，不会自动启动或确认防御就绪。"
+                  if action == "install" else
+                  "是否卸载当前程序的 Windows 防御服务？\n服务必须已停止；本操作不会替你停止服务。")
+        # Reserve before the modal dialog: nested events must not open another request.
+        self._service_busy = True
+        self.install_service_btn.configure(state="disabled")
+        self.uninstall_service_btn.configure(state="disabled")
+        confirmed = False
+        try:
+            confirmed = messagebox.askyesno(f"确认{label}服务", prompt, parent=self)
+        finally:
+            if not confirmed or self._closing:
+                self._service_busy = False
+                if not self._closing:
+                    self.install_service_btn.configure(state="normal")
+                    self.uninstall_service_btn.configure(state="normal")
+        if not confirmed or self._closing:
+            return
+        self.service_status.configure(text=f"正在{label}服务，请等待；不会自动启动或停止服务。")
+        results = queue.Queue(maxsize=1)
+
+        def work():
+            # Workers only publish data; all Tk calls stay on the UI thread.
+            try:
+                from core import defense_control
+                operation = defense_control.install if action == "install" else defense_control.uninstall
+                result = operation(allow_system_effects=True)
+                if not isinstance(result, dict):
+                    raise ValueError("Invalid service controller result")
+            except Exception as exc:
+                result = {"ok": False, "code": "service_error", "error": str(exc)}
+            results.put_nowait(result)
+
+        try:
+            threading.Thread(target=work, daemon=True).start()
+        except Exception as exc:
+            self._finish_service_action(action, {"ok": False, "code": "worker_start_failed", "error": str(exc)})
+            return
+        self._service_ui_timer = self.after(100, self._poll_service_action, action, results)
+
+    def _poll_service_action(self, action, results):
+        self._service_ui_timer = None
+        if self._closing:
+            return
+        try:
+            result = results.get_nowait()
+        except queue.Empty:
+            self._service_ui_timer = self.after(100, self._poll_service_action, action, results)
+            return
+        self._finish_service_action(action, result)
+
+    def _finish_service_action(self, action, result):
+        self._service_busy = False
+        if self._closing:
+            return
+        self.install_service_btn.configure(state="normal")
+        self.uninstall_service_btn.configure(state="normal")
+        label = "安装" if action == "install" else "卸载"
+        code = str(result.get("code", "unknown"))
+        successes = {
+            "install": {"installed": "服务已安装，未自动启动；这不代表防御已就绪。",
+                        "already_installed": "当前程序的服务已经安装，本次未修改或启动服务。"},
+            "uninstall": {"uninstalled": "服务已卸载；本次没有自动停止任何服务。"},
+        }
+        failures = {
+            "not_installed": "未找到已安装的防御服务，无需卸载。",
+            "authorization_required": "服务操作未获得明确授权，未执行。",
+            "invalid_deployment": "当前程序路径或部署形式不适合注册服务，请检查程序安装位置。",
+            "access_denied": "权限不足，无法完成操作。请以管理员身份重新打开 VirusWise。",
+            "service_busy": "服务尚未停止，拒绝卸载。请先明确停止服务后再试；本次未请求停止。",
+            "deployment_mismatch": "同名服务不属于当前程序路径或配置，未擅自修改。请先核对已有服务。",
+            "pending_delete": "服务处于等待删除状态，尚未确认卸载完成。请等待占用句柄释放后再检查。",
+            "dependency_missing": "缺少 Windows 服务运行依赖（pywin32），操作未完成。",
+            "unsupported_platform": "此功能仅支持 Windows。",
+            "cancelled": "操作被中断，结果未确认；已提交的请求不一定撤回，请检查服务状态。",
+            "worker_start_failed": "后台任务未能启动，未发送服务操作请求。",
+        }
+        message = successes[action].get(code) if result.get("ok") is True else None
+        confirmed = message is not None
+        if not confirmed:
+            message = failures.get(code, f"未能确认{label}完成（代码：{code}）。请检查服务状态，不要把它视为成功。")
+            if result.get("install_requested") or result.get("uninstall_requested"):
+                message += "\n请求可能已经提交；失败提示不代表系统完全没有变化。"
+        self.service_status.configure(text=message)
+        main_log(f"服务{label}结果 [{code}]: {message}; {result.get('error', '')}")
+        dialog = messagebox.showinfo if confirmed else messagebox.showwarning
+        dialog(f"服务{label}结果", message, parent=self)
+
     def _build_tools_page(self):
         frame = ctk.CTkFrame(self.content_frame)
         ctk.CTkLabel(frame, text="小工具", font=("Arial", 14, "bold")).pack(pady=10)
@@ -382,7 +492,6 @@ class VirusWiseApp(ctk.CTk):
         grp2 = ctk.CTkFrame(frame)
         grp2.pack(fill="x", padx=10, pady=5)
         ctk.CTkLabel(grp2, text="彩蛋 & 娱乐", font=("Arial", 12, "bold")).pack(anchor="w", padx=5, pady=(5,0))
-        ctk.CTkButton(grp2, text="打开mc1.8.8", command=self.open_mc188, fg_color="green").pack(pady=5, padx=10, anchor="w")
         ctk.CTkButton(grp2, text="千万别点", command=self.play_rickroll, fg_color="red").pack(pady=5, padx=10, anchor="w")
 
         grp3 = ctk.CTkFrame(frame)
@@ -738,11 +847,6 @@ class VirusWiseApp(ctk.CTk):
         except Exception as e: messagebox.showerror("错误", str(e))
 
     def open_quarantine(self): os.startfile(QUARANTINE_DIR)
-
-    def open_mc188(self):
-        html_path = os.path.join(DATA_DIR, "Mc1.8.8.html")
-        if os.path.exists(html_path): os.startfile(html_path)
-        else: messagebox.showerror("错误", f"文件不存在: {html_path}")
 
     def manage_autoruns(self):
         if not self.config.get('autoruns_prompted', False):
@@ -1259,6 +1363,10 @@ class VirusWiseApp(ctk.CTk):
     def destroy(self):
         if self._closing:
             return
+        if self._service_busy and not messagebox.askyesno(
+                "服务操作尚未确认", "后台服务操作尚未返回。关闭窗口不会撤回已提交的请求，结果可能无法显示。\n仍要关闭吗？",
+                parent=self):
+            return
         self._closing = True
         recording_cancel = getattr(self, '_record_cancel', None)
         if recording_cancel is not None:
@@ -1272,7 +1380,7 @@ class VirusWiseApp(ctk.CTk):
         self.proc_btn.configure(state="disabled")
         self._cleanup_all_rick_popups()
         for timer in (getattr(self, 'ad_check_timer', None),
-                      getattr(self, 'suspended_timer_id', None), self._scan_ui_timer):
+                      getattr(self, 'suspended_timer_id', None), self._scan_ui_timer, self._service_ui_timer):
             if timer is not None:
                 self.after_cancel(timer)
         if self.ad and self.ad.running:
