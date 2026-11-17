@@ -1,7 +1,7 @@
 """Configuration access without importing the directory-creating utils.paths.
 
 Reads never create directories. Writes are atomic and serialized across GUI/CLI
-processes. Ordinary saves cannot overwrite recording metadata from a stale GUI.
+processes. Ordinary saves cannot overwrite disk-owned metadata from a stale GUI.
 """
 import math
 import os
@@ -13,6 +13,8 @@ from contextlib import contextmanager
 
 _config_lock = threading.RLock()
 _RECORDING_KEYS = ('last_whitelist_recorded_at', 'last_whitelist_snapshot_id')
+UPDATE_CHECK_INTERVAL = 24 * 60 * 60
+_PROTECTED_METADATA_KEYS = _RECORDING_KEYS + ('last_update_check_at',)
 _DEFAULTS = {
     'apikey': '', 'sensitive': False, 'auto_process': False, 'virustotal': True,
     'windows_defender': False, 'windows_defender_offline_only': True,
@@ -22,6 +24,7 @@ _DEFAULTS = {
     'wl_by_hash': True, 'ad_warned_on_enable': False,
     'autoruns_prompted': False, 'theme': 'default',
     'last_whitelist_recorded_at': None, 'last_whitelist_snapshot_id': '',
+    'last_update_check_at': None,
 }
 
 
@@ -54,7 +57,7 @@ def _read_config(path, strict):
             if not line or '=' not in line:
                 continue
             key, value = line.split('=', 1)
-            if key == 'last_whitelist_recorded_at':
+            if key in ('last_whitelist_recorded_at', 'last_update_check_at'):
                 try:
                     stamp = float(value)
                     config[key] = stamp if math.isfinite(stamp) else None
@@ -157,17 +160,17 @@ def _atomic_save(config, path, before_replace=None):
 
 
 def save_config(config, *, path=None, strict=False):
-    """Save preferences, retaining disk recording metadata; return success.
+    """Save preferences, retaining disk-owned metadata; return success.
 
-    strict=True propagates errors. Only commit_whitelist_recording may advance
-    the success timestamp; a previously loaded GUI dict is not authoritative.
+    strict=True propagates errors. Recording and update-check timestamps are
+    changed only by their dedicated commits, never by a cached GUI dictionary.
     """
     path = path or config_path()
     try:
         with _write_lock(path):
             current = _read_config(path, True)
             merged = dict(current, **config)
-            for key in _RECORDING_KEYS:
+            for key in _PROTECTED_METADATA_KEYS:
                 merged[key] = current[key]
             _atomic_save(merged, path)
         return True
@@ -194,3 +197,28 @@ def commit_whitelist_recording(recorded_at, snapshot_id, *, path=None, before_co
         config['last_whitelist_snapshot_id'] = snapshot_id
         _atomic_save(config, path, before_replace=before_commit)
     return True
+
+
+def claim_update_check(checked_at=None, *, force=False, path=None):
+    """Atomically reserve an attempt; return (claimed, last_attempt_timestamp).
+
+    Failed HTTP attempts also count. Call this before networking, off the GUI
+    thread. A future timestamp (clock rollback) is repaired by a new attempt.
+    No stale preferences or whitelist metadata are written back.
+    """
+    path = path or config_path()
+    with _write_lock(path):
+        # Take the clock inside the lock: queued workers must not mistake a
+        # slightly newer writer's timestamp for a system clock rollback.
+        checked_at = time.time() if checked_at is None else checked_at
+        if (isinstance(checked_at, bool) or not isinstance(checked_at, (int, float))
+                or not math.isfinite(checked_at) or checked_at <= 0):
+            raise ValueError('Invalid update-check timestamp')
+        config = _read_config(path, True)
+        previous = config['last_update_check_at']
+        if (not force and previous is not None and 0 < previous <= checked_at
+                and checked_at - previous < UPDATE_CHECK_INTERVAL):
+            return False, previous
+        config['last_update_check_at'] = checked_at
+        _atomic_save(config, path)
+    return True, checked_at

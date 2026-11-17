@@ -2,6 +2,8 @@ import os, sys, time, threading, queue, hashlib, random, ctypes, subprocess, zip
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+import math
+import webbrowser
 import tkinter as tk
 from tkinter import messagebox, filedialog, ttk
 from types import SimpleNamespace, MappingProxyType
@@ -12,6 +14,9 @@ import psutil
 import requests
 from utils.paths import BASE_DIR, DATA_DIR, QUARANTINE_DIR, WHITELIST_FILE, THEME_WARM_YELLOW
 from utils.config import load_config, save_config
+from utils.update_checker import (CURRENT_VERSION, UPDATE_CHECK_INTERVAL,
+                                  UpdateCheckResult, check_for_updates,
+                                  seconds_until_update_check)
 from utils.whitelist import load_whitelist, save_whitelist
 from utils.hash import get_file_hash
 from utils.quarantine import quarantine
@@ -112,7 +117,7 @@ class VirusWiseApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         sys.app = self
-        self.title("VirusWise 2.6.6+")
+        self.title(f"VirusWise {CURRENT_VERSION}+")
         self.geometry("900x650")
         self.minsize(900, 650)
 
@@ -134,6 +139,10 @@ class VirusWiseApp(ctk.CTk):
         self._scan_ui_timer = None
         self._service_ui_timer = None
         self._service_busy = False
+        self._update_busy = False
+        self._update_timer = None
+        self._update_poll_timer = None
+        self._update_results = queue.Queue(maxsize=1)
         self._scan_events = queue.Queue(maxsize=256)
         self._scan_cancel = threading.Event()
         self._signature_cancel = threading.Event()
@@ -152,6 +161,7 @@ class VirusWiseApp(ctk.CTk):
         self._build_ui()
         self._init_defender_check()
         self._start_timers()
+        self._update_timer = self.after(1500, self._auto_check_updates)
         self.protocol("WM_DELETE_WINDOW", self.destroy)
 
         watchdog_available = admod.WATCHDOG_AVAILABLE
@@ -178,6 +188,10 @@ class VirusWiseApp(ctk.CTk):
             btn = ctk.CTkButton(self.nav_frame, text=text, command=cmd, width=130)
             btn.pack(pady=5, padx=10)
 
+        self.update_check_btn = ctk.CTkButton(
+            self.nav_frame, text="检查更新", command=self.check_updates, width=130)
+        self.update_check_btn.pack(side="bottom", padx=10, pady=10)
+
         self.content_frame = ctk.CTkFrame(self)
         self.content_frame.pack(side="right", expand=True, fill="both")
 
@@ -191,6 +205,94 @@ class VirusWiseApp(ctk.CTk):
 
         self.show_main()
 
+
+    def check_updates(self):
+        self._start_update_check(manual=True)
+
+    def _auto_check_updates(self):
+        self._update_timer = None
+        if not self._closing:
+            self._start_update_check(manual=False)
+
+    def _schedule_update_check(self, checked_at=None):
+        if self._closing:
+            return
+        if self._update_timer is not None:
+            self.after_cancel(self._update_timer)
+        # On a configuration failure, retry tomorrow rather than spin in a loop.
+        delay = (UPDATE_CHECK_INTERVAL if checked_at is None
+                 else seconds_until_update_check(checked_at))
+        self._update_timer = self.after(max(1000, math.ceil(delay * 1000)),
+                                       self._auto_check_updates)
+
+    def _start_update_check(self, *, manual):
+        if self._closing or self._update_busy:
+            return
+        if self._update_timer is not None:
+            self.after_cancel(self._update_timer)
+            self._update_timer = None
+        self._update_busy = True
+        self.update_check_btn.configure(state="disabled", text="正在检查…")
+        results = self._update_results
+
+        def work():
+            # No Tk calls here, including after(). Late results are harmless.
+            try:
+                result = check_for_updates(force=manual)
+            except Exception as exc:
+                result = UpdateCheckResult("error", f"更新检查失败：{exc}")
+            results.put_nowait(result)
+
+        try:
+            threading.Thread(target=work, name="VirusWiseUpdateCheck", daemon=True).start()
+        except Exception as exc:
+            self._update_busy = False
+            self.update_check_btn.configure(state="normal", text="检查更新")
+            self._schedule_update_check()
+            main_log(f"无法启动更新检查：{exc}")
+            if manual:
+                messagebox.showwarning("检查更新失败", str(exc), parent=self)
+            return
+        self._update_poll_timer = self.after(100, self._poll_update_check, manual)
+
+    def _poll_update_check(self, manual):
+        self._update_poll_timer = None
+        if self._closing:
+            return
+        try:
+            result = self._update_results.get_nowait()
+        except queue.Empty:
+            self._update_poll_timer = self.after(100, self._poll_update_check, manual)
+            return
+        self._update_busy = False
+        self.update_check_btn.configure(state="normal", text="检查更新")
+        if result.checked_at is not None:
+            self.config['last_update_check_at'] = result.checked_at
+        self._schedule_update_check(result.checked_at)
+        if result.status == "available":
+            main_log(f"发现 VirusWise 新版本：{result.latest_version}")
+            if messagebox.askyesno(
+                    "发现新版本",
+                    f"当前版本：{CURRENT_VERSION}\n最新版本：{result.latest_version}\n\n"
+                    "是否打开 GitHub 发布页面？不会自动下载或安装。", parent=self):
+                if not self._closing:
+                    try:
+                        opened = webbrowser.open(result.release_url)
+                    except Exception:
+                        opened = False
+                    if not opened:
+                        messagebox.showwarning("无法打开浏览器", result.release_url, parent=self)
+        elif result.status == "up_to_date":
+            if manual:
+                messagebox.showinfo("检查更新", f"当前版本 {CURRENT_VERSION} 已是最新，或高于最新正式发布版。",
+                                    parent=self)
+        elif result.status != "skipped":
+            main_log(f"更新检查：{result.message}")
+            if manual:
+                if result.status == "error":
+                    messagebox.showwarning("检查更新失败", result.message, parent=self)
+                else:
+                    messagebox.showinfo("检查更新", result.message, parent=self)
 
     def _show_page(self, name):
         for page in self.pages.values(): page.pack_forget()
@@ -1380,9 +1482,12 @@ class VirusWiseApp(ctk.CTk):
         self.proc_btn.configure(state="disabled")
         self._cleanup_all_rick_popups()
         for timer in (getattr(self, 'ad_check_timer', None),
-                      getattr(self, 'suspended_timer_id', None), self._scan_ui_timer, self._service_ui_timer):
+                      getattr(self, 'suspended_timer_id', None), self._scan_ui_timer, self._service_ui_timer,
+                      self._update_timer, self._update_poll_timer):
             if timer is not None:
                 self.after_cancel(timer)
+        self._update_timer = None
+        self._update_poll_timer = None
         if self.ad and self.ad.running:
             # Active-defense lifecycle is a separate repair batch; do not enable it here.
             threading.Thread(target=self.ad.stop, daemon=True).start()
