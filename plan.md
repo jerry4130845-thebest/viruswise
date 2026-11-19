@@ -1,4 +1,4 @@
-# VirusWise 更新检查模块计划与发布指南
+# VirusWise 自动更新与发布指南
 
 ## 1. 目标与边界
 
@@ -8,7 +8,7 @@
 - 持续运行时按“最近一次检查尝试时间 + 24 小时”继续安排自动检查。
 - 手动按钮不受 24 小时限制；手动检查也重新计算下次自动检查时间。
 - 成功、断网、超时、限流、不规范标签等**已经发起的检查尝试都计时**。
-- 只检查与提示；用户确认后打开 GitHub 发布页面，不下载、不安装、不覆盖程序。
+- Windows 新布局打包版：有可用资产时，征得确认后下载，由独立更新器安装。源码模式、旧平铺版或无合规资产仅提供发布页。
 - 不修改查杀、主动防御、服务管理、依赖或现有用户配置数据。
 
 ## 2. 文件范围
@@ -16,8 +16,12 @@
 | 文件 | 职责 |
 | --- | --- |
 | [ui/app.py](<ui/app.py>) | 左下角按钮、后台线程、结果队列、主线程提示、周期调度与退出清理 |
-| [utils/config.py](<utils/config.py>) | 时间解析、磁盘权威元数据保护、跨进程原子检查预约 |
+| [utils/config.py](<utils/config.py>)（本轮未改） | 时间解析、磁盘权威元数据保护、跨进程原子检查预约 |
 | [utils/update_checker.py](<utils/update_checker.py>) | 版本常量、版本比较、GitHub 查询、结构化结果与错误处理 |
+| [main.py](<main.py>) | 打包版启动门禁和新版就绪确认 |
+| [updater.py](<updater.py>)、[updater.spec](<updater.spec>) | 独立 Windows 更新器、安装与恢复协议 |
+| [utils/updater.py](<utils/updater.py>) | 下载、ZIP/PE 验证、Windows 安装锁与覆盖回滚 |
+| [viruswise.spec](<viruswise.spec>) | 构建 Windows onedir、收集更新器和内置版本清单 |
 | [plan.md](<plan.md>) | 实现方案、发布要求与验证清单 |
 
 ## 3. 版本与 GitHub Release 约定
@@ -64,24 +68,45 @@ last_update_check_at=1794873600.0
 - 配置锁、磁盘及网络均在独立 daemon 线程执行，不阻塞主线程。
 - 后台只投递结果，不调用 Tk，包括不从后台调用 after。
 - 主线程每 100 毫秒轮询结果，恢复按钮并重排下次检查。
-- 有更新：显示本地/远端版本，询问是否打开浏览器，拒绝不触发下载。
+- 有更新且可自动安装：显示版本、大小和退出提示，由用户明确确认；下载可取消。否则提供固定仓库的发布页。
 - 无更新：只在手动检查时弹提示。
 - 失败、无 Release 或标签不规范：手动提示，自动只记录日志。
 - HTTP 连接超时 5 秒，读取超时 15 秒；这是请求阶段超时，不是整个流程的硬性总时限。
 - 403/429 限流、404、HTTP 错误、无效 JSON、TLS/网络失败均不能当作“已最新”。
 - 退出时取消自动检查/启动回调及结果轮询；迟到结果不会访问已销毁的界面。
-- 更新线程不加入扫描工作线程集合，关闭窗口不必等待更新请求，也不会因此误报扫描未完成。
+- 检查请求不会阻塞关闭。下载中关窗会请求取消，网络调用返回后完成清理再结束进程；下载不被算作扫描。
 
-## 6. 后续正式发布步骤
+## 6. 自动安装与恢复
 
-1. 在 [utils/update_checker.py](<utils/update_checker.py>) 修改 **CURRENT_VERSION** 为这次实际发布的三段版本号，例如 3.0.1；不要保留 2.6.6 直接打包新版本，否则新包会重复提示自己更新。
-2. 使用项目原有流程打包并验证；本次不修改打包配置。新增模块由 [ui/app.py](<ui/app.py>) 静态导入，正常情况下 PyInstaller 会自动分析收集，仍需做真实打包验收。
-3. 创建正式 GitHub Release，tag 例如 V3.0.1，上传实际发布包并填写变更说明。
-4. 不勾选 prerelease，不保留为 draft；确认新 Release 是 Latest。
-5. 在旧客户端手动检查，确认只在同意后打开正确的发布页面。
-6. 在新包检查，确认不再把相同版本提示为更新。
+1. 固定使用 `VirusWise-Vx.y.z.zip`（对应 Release tag），要求唯一同名上传资产、上传完成、大小有效、GitHub 提供 SHA-256、下载 URL 指向固定仓库。其他附件不会被选中。仅接受 GitHub 和允许的资产 CDN HTTPS 跳转。
+2. 后台下载到受管理员保护的独占目录；流式检查长度和 SHA-256，代理/TLS 错误或取消时不覆盖。更新器从当前已安装的可信副本复制到安装目录之外启动，再验一次下载包。此设计信任 GitHub 仓库与发布账号；同源 SHA-256 不是独立的发布签名。
+3. 更新器核实旧进程路径和创建时间，再发就绪信号。界面必须提交，更新器等待 Windows 进程句柄变为已退出，不能只等窗口销毁或固定睡眠。如果服务已运行、正在启动/停止，或者无法确认状态，拒绝安装，不会操作服务。
+4. 独占安装锁内安全解压到同卷的受控目录并重新检查服务；拒绝越界路径、重复/冲突、链接、重解析点、非托管文件、错误版本/协议/PE 架构。先移开旧主 EXE，备份并替换运行时和更新器，最后放入新主 EXE。只更新包根两个 EXE 和整个 `_internal`；不要把用户数据放在这个运行时子目录内。安装根的 `data`、配置、白名单、配置档、隔离区和其他文件原样保留。
+5. 用明确的安装路径启动新版。在界面完成初始化后，新版必须确认 PID 和内置目标版本。确认后才释放门禁、清理包及备份，新版负责在独立进程退出后删除其临时副本；被占用时下次启动重试。无确认或覆盖失败时，更新器尝试还原原版，无法确认回滚时保留备份和日志。
 
-## 7. 验证计划
+如果机器在替换过程中断电或更新器被终止：**先保留安装根和更新事务目录，不要删除门禁或备份**。在管理员 PowerShell 中，确认其他 VirusWise 实例已退出、服务已手动停止；找到失败提示给出的受保护事务目录（系统 Program Files 下的 `VirusWise-update-<事务编号>`，编号可从安装根的 `.viruswise-update.pending` 查看）。保留该目录内的 `_internal`，运行该目录中原有的 `VirusWiseUpdater.exe --recover <事务编号>`。恢复只处理同一事务；如果已持久记录新版确认，则仅收尾，否则尝试回滚。有占用或异常时不要强行覆盖，先保留 `error.json` 与备份。
+
+## 7. 发布步骤
+
+1. 修改 [CURRENT_VERSION](<versions.py#L3>) 为实际发布的三段数字版本，例如 `3.0.1`。用同一 Windows Python 架构、同一输出目录按顺序构建：
+
+~~~powershell
+python -m PyInstaller --noconfirm updater.spec
+python -m PyInstaller --noconfirm viruswise.spec
+~~~
+
+2. 从**从未运行过的干净构建产物**中归档；不要压缩外层 `VirusWise` 文件夹，也不要从已含运行数据的安装目录制作包。可在仓库根运行：
+
+~~~powershell
+python -m zipfile -c VirusWise-V3.0.1.zip dist/VirusWise/VirusWise.exe dist/VirusWise/VirusWiseUpdater.exe dist/VirusWise/_internal
+~~~
+
+3. ZIP 根目录只有 `VirusWise.exe`、`VirusWiseUpdater.exe`、`_internal/`；内含打包生成的版本/协议清单和运行时。发布正式 tag `V3.0.1` 并设为 Latest；确认 API 的 asset `digest` 字段已生成。
+4. **首次更换成含更新器的新布局需要手动安装一次**。为避免平铺版残留 DLL 干扰，用一个干净安装目录，按需复制 `data` 和 `quarantine`。若已有服务注册在旧路径，迁移依然是独立运维操作，不会被更新器自动重注册。后续验收使用带更新器的旧版和更高的测试版，验证其 UI、新版确认、服务阻止和清理。
+
+> 建议安装在本地 NTFS 上、仅受信人员可写的专用目录。不要使用网络共享、联接点或多人可写的安装目录；和原有管理员启动要求一样，安装目录的可执行文件必须可信。
+
+## 8. 第一阶段检查更新验证（历史）
 
 自动验证只用临时配置、模拟 HTTP 与 AST 提取的 UI 方法，不导入或启动完整 GUI，不触发查杀/主动防御，不修改用户运行数据，不安装包。
 
@@ -109,3 +134,27 @@ PASS: shutdown cancels both timers and is idempotent (AST; no application starte
 验证命令使用系统 Python 3.11、-B 禁用字节码写入、临时目录注入配置路径、unittest.mock 模拟网络；UI 方法由 AST 提取，未导入完整应用。没有修改既有测试文件、用户配置或依赖。
 
 真实 GUI、真实 GitHub 链路与打包属于单独的人工/发布验收；不能用模拟通过代替。
+
+## 9. 自动安装验证
+
+PyInstaller 6.20 在 Windows 临时目录实际构建主程序和独立更新器。用发布命令生成 ZIP，并在本地磁盘临时安装目录验证。最终输出：
+
+~~~text
+PASS: 7 Python/spec files compile
+PASS: publisher ZIP has expected layout: 1265 entries
+PASS: real Windows replacement + mocked ACK + cleanup
+PASS: failed startup restores old files and preserves user data
+PASS: packaged --help exits 0 without initializing data
+PASS: copied independent helper launches and rejects missing handoff (exit 2)
+PASS: live Windows process path, creation time and wait handle
+~~~
+
+另验证了 Windows 共享/独占锁、49 种替换与回滚中断组合、重解析点及硬链接拦截，以及下载/服务状态/UI 的模拟分支。未运行真实 GUI，未用正式 Release 下载测试，未执行管理员态完整旧版升新版验收。在 `R:\Temp` 的替换测试遇到 WinError 1；上述通过记录来自本地 C 盘。
+
+## 10. 关于按钮与统一版本号（已实现）
+
+- 在左侧导航栏底部、「检查更新」上方加「关于」按钮。打开小窗口，显示 VirusWise 和当前版本。
+- 提供 [GitHub 项目主页](https://github.com/jerry4130845-thebest/viruswise) 和 [B站空间](https://space.bilibili.com/435616692) 两个按钮；只有点击链接按钮才用默认浏览器打开。
+- 在项目根目录新增 [versions.py](<versions.py>)，集中维护 `CURRENT_VERSION`，保留当前值 `2.6.6`。界面、更新检查、启动确认和打包清单沿用此值。
+- 范围：新增 [versions.py](<versions.py>)，修改 [ui/app.py](<ui/app.py>)、[utils/update_checker.py](<utils/update_checker.py>)、[viruswise.spec](<viruswise.spec>) 和本文。不改更新流程、配置、依赖或既有测试。
+- 已通过：5 个 Python/spec 文件语法检查；模拟更新版本比较；关于按钮、版本显示、两个链接、弹窗复用与关闭；打包清单版本生成。未启动完整程序或真实浏览器，本轮未重新打包。

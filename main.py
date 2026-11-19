@@ -60,7 +60,7 @@ def elevate_if_needed():
     sys.exit(0)
 
 
-def _run_gui():
+def _run_gui(update_launch=None):
     # These imports create directories: never run them for management or SCM.
     from utils.paths import BASE_DIR, DATA_DIR, QUARANTINE_DIR, PROFILES_DIR, CRASH_LOG
 
@@ -75,7 +75,34 @@ def _run_gui():
     elevate_if_needed()
 
     from ui.app import VirusWiseApp
-    app = VirusWiseApp()
+    on_ready = None
+    if getattr(sys, "frozen", False):
+        import threading
+        import time
+        from updater import acknowledge_startup, cleanup_finished_updates
+        from utils.update_checker import CURRENT_VERSION
+
+        def cleanup():
+            # The helper cannot delete its own running image.
+            for delay in ((0, 2, 5) if update_launch is not None else (0,)):
+                time.sleep(delay)
+                try:
+                    cleanup_finished_updates()
+                except Exception as exc:
+                    print(f"更新临时文件清理未完成：{exc}")
+
+        def ready():
+            if update_launch is not None:
+                try:
+                    acknowledge_startup(update_launch, CURRENT_VERSION)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    print(f"无法确认新版启动：{exc}")
+                    app.destroy()
+                    return
+            threading.Thread(target=cleanup, name="VirusWiseUpdateCleanup", daemon=True).start()
+
+        on_ready = ready
+    app = VirusWiseApp(on_ready=on_ready) if on_ready is not None else VirusWiseApp()
     app.mainloop()
     return 0
 
@@ -167,6 +194,28 @@ def _install_elevated():
 
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
+    post_update = len(args) == 2 and args[0] == "--post-update"
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return _dispatch(args)
+    # Elevate normal GUI before opening any application data or install lease.
+    # The post-update child must already inherit the updater's administrator token.
+    if not args:
+        elevate_if_needed()
+    from contextlib import ExitStack
+    from updater import application_gate, UpdateError
+    with ExitStack() as stack:
+        try:
+            launch = stack.enter_context(application_gate(args[1] if post_update else None))
+        except (OSError, ValueError, UpdateError) as exc:
+            if not args:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(None, str(exc), "VirusWise 更新", 0x30)
+                return 5
+            return _error("update_gate", 5, str(exc))
+        return _run_gui(launch) if post_update else _dispatch(args)
+
+
+def _dispatch(args):
     if not args:
         return _run_gui()
     # CLI owns all following arguments; it never implies service installation.
