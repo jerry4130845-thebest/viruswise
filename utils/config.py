@@ -1,8 +1,3 @@
-"""Configuration access without importing the directory-creating utils.paths.
-
-Reads never create directories. Writes are atomic and serialized across GUI/CLI
-processes. Ordinary saves cannot overwrite disk-owned metadata from a stale GUI.
-"""
 import math
 import os
 import sys

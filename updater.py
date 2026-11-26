@@ -12,14 +12,17 @@ from contextlib import contextmanager
 from uuid import uuid4
 
 from utils.updater import (
-    APP_EXE, HELPER_EXE, RUNTIME_DIR, MAX_PACKAGE_BYTES, UpdateError,
-    apply_package, download_package, ensure_service_stopped, extract_package,
-    installation_lock, rollback_package, safe_path, validate_plain_tree, verify_package,
+    APP_EXE, HELPER_EXE, RUNTIME_DIR, MAX_PACKAGE_BYTES, REPOSITORY, UPDATE_PROTOCOL, UpdateError,
+    apply_package, download_package, ensure_service_stopped, extract_helper_package, extract_package,
+    installation_lock, rollback_package, safe_path, validate_package, validate_plain_tree, verify_package,
 )
 
 PREFIX = "VirusWise-update-"
 PENDING = ".viruswise-update.pending"
-HELPER_RUNTIME = Path(RUNTIME_DIR) / "updater-runtime"
+HELPER_DIR = "runner"
+HELPER_ZIP = "updater.zip"
+HELPER_URL = f"https://github.com/{REPOSITORY}/releases/download/updater/{HELPER_ZIP}"
+HELPER_PIN = "viruswise-updater-pin.json"
 TOKEN = re.compile(r"[0-9a-f]{32}")
 VERSION = re.compile(r"[0-9]{1,12}(?:\.[0-9]{1,12}){2}")
 ACK_TIMEOUT = 60
@@ -130,13 +133,21 @@ def _install_root():
     return exe.parent
 
 
+def _helper_pin(root):
+    meta = _read(root / RUNTIME_DIR / HELPER_PIN)
+    if (not meta or meta.keys() != {"size", "sha256"}
+            or type(meta["size"]) is not int or not 0 < meta["size"] <= MAX_PACKAGE_BYTES
+            or not isinstance(meta["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", meta["sha256"])):
+        raise UpdateError("当前安装缺少可信的更新器校验信息。")
+    return meta["size"], meta["sha256"]
+
+
 def can_auto_update():
     try:
         root = _install_root()
-        safe_path(root / HELPER_EXE, kind="file")
-        safe_path(root / HELPER_RUNTIME / "base_library.zip", kind="file")
+        _helper_pin(root)
         return _same_path(safe_path(root / RUNTIME_DIR, kind="dir"), Path(sys._MEIPASS))
-    except (OSError, AttributeError, UpdateError):
+    except (OSError, AttributeError, ValueError, UpdateError):
         return False
 
 
@@ -244,18 +255,29 @@ def prepare_update(*, version, url, size, sha256, cancel, progress):
     session = None
     process = None
     try:
-        download_package(url, size, sha256, work / "package.zip", cancel=cancel, progress=progress)
+        helper_size, helper_sha256 = _helper_pin(root)
+        total = size + helper_size
+        package = work / "package.zip"
+        download_package(url, size, sha256, package, cancel=cancel,
+                         progress=lambda received, _: progress(received, total))
+        validate_package(package, version=version)
+        helper_zip = work / HELPER_ZIP
+        runner = work / HELPER_DIR
+        try:
+            download_package(HELPER_URL, helper_size, helper_sha256, helper_zip, cancel=cancel,
+                             progress=lambda received, _: progress(size + received, total))
+            extract_helper_package(helper_zip, runner, size=helper_size, sha256=helper_sha256)
+            helper_zip.unlink()
+        except (OSError, UpdateError) as exc:
+            raise UpdateError(f"无法准备 GitHub 更新器：{exc}") from exc
         if cancel.is_set():
             raise UpdateError("更新已取消。")
-        helper = work / HELPER_EXE
-        shutil.copyfile(safe_path(root / HELPER_EXE, kind="file"), helper)
+        helper = safe_path(runner / HELPER_EXE, kind="file")
         with _open_process(os.getpid()) as parent:
             _write(work / "request.json", {"root": str(root), "version": version, "size": size,
                                           "sha256": sha256, "parent": os.getpid(),
-                                          "parent_started": _started(parent)})
-        # Copy the whole helper runtime so it never loads files being replaced.
-        shutil.copytree(validate_plain_tree(root / HELPER_RUNTIME), work / RUNTIME_DIR)
-        process = _launch(helper, ["--apply", token], cwd=work, hidden=True)
+                                          "parent_started": _started(parent), "protocol": UPDATE_PROTOCOL})
+        process = _launch(helper, ["--apply", token], cwd=runner, hidden=True)
         session = _Session(work, process, cancel)
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline and not cancel.is_set():
@@ -290,7 +312,8 @@ def prepare_update(*, version, url, size, sha256, cancel, progress):
 def _request(work):
     work = _trusted_work(work)
     req = _read(work / "request.json")
-    if (not req or not isinstance(req.get("root"), str) or not Path(req["root"]).is_absolute()
+    if (not req or type(req.get("protocol")) is not int or req["protocol"] != UPDATE_PROTOCOL
+            or not isinstance(req.get("root"), str) or not Path(req["root"]).is_absolute()
             or not isinstance(req.get("version"), str) or not VERSION.fullmatch(req["version"])
             or type(req.get("size")) is not int or not 0 < req["size"] <= MAX_PACKAGE_BYTES
             or not isinstance(req.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", req["sha256"])):
@@ -356,7 +379,6 @@ def _apply_after_exit(work, root, token, req):
             _private_mkdir(stage_root, runtime=True)
             own_stage = True
             extract_package(work / "package.zip", stage, version=req["version"])
-            safe_path(stage / HELPER_RUNTIME / "base_library.zip", kind="file")
             _private_mkdir(backup)
             ensure_service_stopped()
             # The journal is durable before the gate/first program file rename.
@@ -421,6 +443,7 @@ def _apply(work, root, token, req):
                        expected_started=req.get("parent_started")) as parent:
         ensure_service_stopped()
         verify_package(work / "package.zip", req["size"], req["sha256"])
+        validate_package(work / "package.zip", version=req["version"])
         _write(work / "ready.json", {"ready": True})
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
@@ -523,7 +546,7 @@ def cleanup_finished_updates():
                     continue
                 # The helper may still be unmapping its own EXE. Try
                 # this deletion first, leaving the request intact on failure.
-                helper = work / HELPER_EXE
+                helper = work / HELPER_DIR / HELPER_EXE
                 try:
                     safe_path(helper, kind="file").unlink()
                 except FileNotFoundError:
@@ -545,7 +568,7 @@ def _helper_main():
     try:
         work = _trusted_work(_work_path(token))
         if not getattr(sys, "frozen", False) or not _same_path(
-                safe_path(Path(sys.executable), kind="file"), work / HELPER_EXE):
+                safe_path(Path(sys.executable), kind="file"), work / HELPER_DIR / HELPER_EXE):
             raise UpdateError("只能从独立事务目录运行安装程序。")
         trusted = True
         req, root = _request(work)

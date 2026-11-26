@@ -76,33 +76,32 @@ last_update_check_at=1794873600.0
 - 退出时取消自动检查/启动回调及结果轮询；迟到结果不会访问已销毁的界面。
 - 检查请求不会阻塞关闭。下载中关窗会请求取消，网络调用返回后完成清理再结束进程；下载不被算作扫描。
 
-## 6. 自动安装与恢复
+## 6. 自动安装与恢复（协议 2）
 
 1. 固定使用 `VirusWise-Vx.y.z.zip`（对应 Release tag），要求唯一同名上传资产、上传完成、大小有效、GitHub 提供 SHA-256、下载 URL 指向固定仓库。其他附件不会被选中。仅接受 GitHub 和允许的资产 CDN HTTPS 跳转。
-2. 后台下载到受管理员保护的独占目录；流式检查长度和 SHA-256，代理/TLS 错误或取消时不覆盖。更新器从当前已安装的可信副本复制到安装目录之外启动，再验一次下载包。此设计信任 GitHub 仓库与发布账号；同源 SHA-256 不是独立的发布签名。
+2. 后台下载到受管理员保护的独占目录；流式检查长度和 SHA-256，代理/TLS 错误或取消时不覆盖。确认更新后，再从固定 tag `updater` 下载 `updater.zip`，按客户端内置的大小和 SHA-256 校验，解压到安装目录之外的受保护事务目录。只启动该事务中的更新器，它会重验主程序 ZIP。主程序 ZIP 的同源 SHA-256 不是独立的发布签名。
 3. 更新器核实旧进程路径和创建时间，再发就绪信号。界面必须提交，更新器等待 Windows 进程句柄变为已退出，不能只等窗口销毁或固定睡眠。如果服务已运行、正在启动/停止，或者无法确认状态，拒绝安装，不会操作服务。
-4. 独占安装锁内安全解压到同卷的受控目录并重新检查服务；拒绝越界路径、重复/冲突、链接、重解析点、非托管文件、错误版本/协议/PE 架构。先移开旧主 EXE，备份并替换运行时和更新器，最后放入新主 EXE。只更新包根两个 EXE 和整个 `_internal`；不要把用户数据放在这个运行时子目录内。安装根的 `data`、配置、白名单、配置档、隔离区和其他文件原样保留。
+4. 独占安装锁内安全解压到同卷的受控目录并重新检查服务；拒绝越界路径、重复/冲突、链接、重解析点、非托管文件、错误版本/协议/PE 架构。先移开旧主 EXE，备份并替换运行时，最后放入新主 EXE。只更新主程序 EXE 和整个 `_internal`；不要把用户数据放在这个运行时子目录内。安装根的 `data`、配置、白名单、配置档、隔离区和其他文件原样保留。
 5. 用明确的安装路径启动新版。在界面完成初始化后，新版必须确认 PID 和内置目标版本。确认后才释放门禁、清理包及备份，新版负责在独立进程退出后删除其临时副本；被占用时下次启动重试。无确认或覆盖失败时，更新器尝试还原原版，无法确认回滚时保留备份和日志。
 
-如果机器在替换过程中断电或更新器被终止：**先保留安装根和更新事务目录，不要删除门禁或备份**。在管理员 PowerShell 中，确认其他 VirusWise 实例已退出、服务已手动停止；找到失败提示给出的受保护事务目录（系统 Program Files 下的 `VirusWise-update-<事务编号>`，编号可从安装根的 `.viruswise-update.pending` 查看）。保留该目录内的 `_internal`，运行该目录中原有的 `VirusWiseUpdater.exe --recover <事务编号>`。恢复只处理同一事务；如果已持久记录新版确认，则仅收尾，否则尝试回滚。有占用或异常时不要强行覆盖，先保留 `error.json` 与备份。
+如果机器在替换过程中断电或更新器被终止：**先保留安装根和更新事务目录，不要删除门禁或备份**。在管理员 PowerShell 中，确认其他 VirusWise 实例已退出、服务已手动停止；找到失败提示给出的受保护事务目录（系统 Program Files 下的 `VirusWise-update-<事务编号>`，编号可从安装根的 `.viruswise-update.pending` 查看）。保留该目录的 `runner` 子目录及其依赖，从该子目录运行 `VirusWiseUpdater.exe --recover <事务编号>`。恢复只处理同一事务；如果已持久记录新版确认，则仅收尾，否则尝试回滚。有占用或异常时不要强行覆盖，先保留 `error.json` 与备份。
 
 ## 7. 发布步骤
 
-1. 修改 [CURRENT_VERSION](<versions.py#L3>) 为实际发布的三段数字版本，例如 `3.0.1`。用同一 Windows Python 架构、同一输出目录按顺序构建：
+1. 修改 [CURRENT_VERSION](<versions.py#L3>) 为实际发布的三段数字版本，例如 `3.0.1`。使用与已发布更新器匹配的 Windows Python 架构，仅构建主程序（不需要本地更新器，也不会下载它）：
 
 ~~~powershell
-python -m PyInstaller --noconfirm updater.spec
 python -m PyInstaller --noconfirm viruswise.spec
 ~~~
 
 2. 从**从未运行过的干净构建产物**中归档；不要压缩外层 `VirusWise` 文件夹，也不要从已含运行数据的安装目录制作包。可在仓库根运行：
 
 ~~~powershell
-python -m zipfile -c VirusWise-V3.0.1.zip dist/VirusWise/VirusWise.exe dist/VirusWise/VirusWiseUpdater.exe dist/VirusWise/_internal
+python -m zipfile -c VirusWise-V3.0.1.zip dist/VirusWise/VirusWise.exe dist/VirusWise/_internal
 ~~~
 
-3. ZIP 根目录只有 `VirusWise.exe`、`VirusWiseUpdater.exe`、`_internal/`；内含打包生成的版本/协议清单和运行时。发布正式 tag `V3.0.1` 并设为 Latest；确认 API 的 asset `digest` 字段已生成。
-4. **首次更换成含更新器的新布局需要手动安装一次**。为避免平铺版残留 DLL 干扰，用一个干净安装目录，按需复制 `data` 和 `quarantine`。若已有服务注册在旧路径，迁移依然是独立运维操作，不会被更新器自动重注册。后续验收使用带更新器的旧版和更高的测试版，验证其 UI、新版确认、服务阻止和清理。
+3. ZIP 根目录只有 `VirusWise.exe` 和 `_internal/`；内含打包生成的版本/协议清单和运行时。发布正式 tag `V3.0.1` 并设为 Latest；确认 API 的 asset `digest` 字段已生成。
+4. **首次切换到协议 2 需手动安装一次**。使用干净目录并按需迁移 `data` 和 `quarantine`。已有服务若指向旧路径，需单独迁移，不会自动重注册。后续更新由协议 2 客户端从 GitHub 自动下载独立更新器。
 
 > 建议安装在本地 NTFS 上、仅受信人员可写的专用目录。不要使用网络共享、联接点或多人可写的安装目录；和原有管理员启动要求一样，安装目录的可执行文件必须可信。
 
@@ -135,7 +134,7 @@ PASS: shutdown cancels both timers and is idempotent (AST; no application starte
 
 真实 GUI、真实 GitHub 链路与打包属于单独的人工/发布验收；不能用模拟通过代替。
 
-## 9. 自动安装验证
+## 9. 自动安装验证（原内置更新器，历史）
 
 PyInstaller 6.20 在 Windows 临时目录实际构建主程序和独立更新器。用发布命令生成 ZIP，并在本地磁盘临时安装目录验证。最终输出：
 
@@ -158,3 +157,13 @@ PASS: live Windows process path, creation time and wait handle
 - 在项目根目录新增 [versions.py](<versions.py>)，集中维护 `CURRENT_VERSION`，保留当前值 `2.6.6`。界面、更新检查、启动确认和打包清单沿用此值。
 - 范围：新增 [versions.py](<versions.py>)，修改 [ui/app.py](<ui/app.py>)、[utils/update_checker.py](<utils/update_checker.py>)、[viruswise.spec](<viruswise.spec>) 和本文。不改更新流程、配置、依赖或既有测试。
 - 已通过：5 个 Python/spec 文件语法检查；模拟更新版本比较；关于按钮、版本显示、两个链接、弹窗复用与关闭；打包清单版本生成。未启动完整程序或真实浏览器，本轮未重新打包。
+
+## 11. 独立更新器发布与验证（协议 2，已实现）
+
+- 主程序打包不再查找或收录本地更新器。保留现有无控制台设置，沿用版本清单，正常发布只构建主程序；打包时不联网。
+- 仍从正式 Latest Release 选择主程序 ZIP。用户确认更新后，再从同仓库的固定 `updater` tag 下载 `updater.zip`；该 tag 不设为 Latest。更新器只存在于受保护的临时事务目录，不安装到主程序目录。
+- 下载的更新器启动前须匹配客户端固定的 SHA-256，并通过路径、文件类型、协议和架构校验。下载、校验或启动失败时不退出旧程序，不回退执行其他来源。若替换这一 ZIP，需要用新摘要构建支持它的主程序。
+- 更新安装协议切换为仅替换主程序 EXE 和运行时目录，保留用户数据、回滚和新版就绪确认。旧版在首次迁移到新协议时需手动升级一次；上一轮的备用更新器 ZIP 不能直接作为新协议产物。
+- 本次已构建独立的 Windows x64 包。把这份 **原始** `updater.zip` 上传到 GitHub 的 `updater` Release，不能重压缩；该 Release 不设为 Latest。包大小 **12,925,800 字节**，SHA-256 为 `157b7aa148b124020b5c23be27484fb2aecca5cc4af077b9cc1515d4447f97d8`。
+- 如确需重建更新器，使用 [updater.spec](<updater.spec>) 单独构建后，在其 `_internal` 中加入 UTF-8 `updater-release.json`，内容为 `{"protocol":2}`；把 `VirusWiseUpdater.exe` 和 `_internal` 放在 ZIP 根目录。重新核对并配置 [viruswise.spec](<viruswise.spec#L13-L15>) 的包大小和 SHA-256。**不要直接覆盖已发布且被旧客户端固定的 ZIP**，否则这些客户端会拒绝下载；需另做兼容发布安排。
+- 已在空输出目录实际构建主程序，确认没有包含更新器。验证了模拟下载成功、404、摘要错误和取消；验证了下载后解压的更新器可启动、失败时不启动更新器，以及 Windows 临时目录的文件替换、回滚和用户数据保留。未上传 GitHub，也未通过真实发布地址做完整 GUI 更新。

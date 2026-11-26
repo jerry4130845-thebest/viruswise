@@ -10,11 +10,9 @@ from PyInstaller.utils.hooks import collect_data_files, copy_metadata
 
 ROOT = Path(SPECPATH).resolve()
 ENTRYPOINT = ROOT / "main.py"
-helper_bundle = Path(CONF["distpath"]) / "VirusWiseUpdater"
-helper = helper_bundle / "VirusWiseUpdater.exe"
-helper_runtime = helper_bundle / "_internal"
-if not helper.is_file() or not (helper_runtime / "base_library.zip").is_file():
-    raise SystemExit("Build updater.spec first, using the same --distpath.")
+# Pin the exact independently published updater.zip; never fetch it at build time.
+UPDATER_SIZE = 12925800
+UPDATER_SHA256 = "157b7aa148b124020b5c23be27484fb2aecca5cc4af077b9cc1515d4447f97d8"
 
 # Extract a checked-in literal without importing GUI code or reading user data.
 tree = ast.parse((ROOT / "ui" / "theme.py").read_text(encoding="utf-8"))
@@ -43,11 +41,15 @@ version = next(
 if not re.fullmatch(r"[0-9]{1,12}(?:\.[0-9]{1,12}){2}", version):
     raise SystemExit("CURRENT_VERSION must be a three-component version.")
 manifest = static_dir / "viruswise-release.json"
-manifest.write_text(json.dumps({"version": version, "protocol": 1}), encoding="utf-8")
+manifest.write_text(json.dumps({"version": version, "protocol": 2}), encoding="utf-8")
+updater_pin = static_dir / "viruswise-updater-pin.json"
+if not 0 < UPDATER_SIZE <= 512 * 1024**2 or not re.fullmatch(r"[0-9a-f]{64}", UPDATER_SHA256):
+    raise SystemExit("The independently published updater.zip needs an exact size and SHA-256 pin.")
+updater_pin.write_text(json.dumps({"size": UPDATER_SIZE, "sha256": UPDATER_SHA256}), encoding="utf-8")
 
 # Standard hooks handle customtkinter/Tcl, pythoncom/pywintypes DLLs and psutil.
 # win10toast needs its default icon and distribution metadata for pkg_resources.
-datas = [(str(theme_file), "resources"), (str(manifest), ".")]
+datas = [(str(theme_file), "resources"), (str(manifest), "."), (str(updater_pin), ".")]
 datas += collect_data_files("win10toast", includes=["data/python.ico"])
 datas += copy_metadata("win10toast")
 hiddenimports = [
@@ -84,7 +86,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,
+    console=False,
     uac_admin=False,
     # Only this runtime subtree is managed by the updater; data remains at the root.
     contents_directory="_internal",
@@ -93,9 +95,6 @@ coll = COLLECT(
     exe,
     a.binaries,
     a.datas,
-    [(helper.name, str(helper), "EXECUTABLE")],
-    [(str(Path("updater-runtime") / path.relative_to(helper_runtime)), str(path), "DATA")
-     for path in sorted(helper_runtime.rglob("*")) if path.is_file()],
     strip=False,
     upx=False,
     name="VirusWise",

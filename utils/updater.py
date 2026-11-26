@@ -30,11 +30,13 @@ MAX_PACKAGE_BYTES = 512 * 1024**2
 APP_EXE = "VirusWise.exe"
 HELPER_EXE = "VirusWiseUpdater.exe"
 RUNTIME_DIR = "_internal"
+UPDATE_PROTOCOL = 2
 
 _LOCK_NAME = ".viruswise-update.lock"
 _DEFENSE_SERVICE = "VirusWiseActiveDefense"
-_ITEMS = ((RUNTIME_DIR, "dir"), (HELPER_EXE, "file"), (APP_EXE, "file"))
-_MANIFEST = (RUNTIME_DIR, "viruswise-release.json")
+_ITEMS = ((RUNTIME_DIR, "dir"), (APP_EXE, "file"))
+_APP_MANIFEST = (RUNTIME_DIR, "viruswise-release.json")
+_HELPER_MANIFEST = (RUNTIME_DIR, "updater-release.json")
 _BASE_LIBRARY = (RUNTIME_DIR, "base_library.zip")
 _REPARSE = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT
 _CHUNK = 256 * 1024
@@ -381,21 +383,24 @@ def download_package(url, size, sha256, dest, *, cancel, progress):
                 pass
 
 
+def _verify_package_stream(package, size, expected):
+    if os.fstat(package.fileno()).st_size != size:
+        raise UpdateError("更新包大小与声明不符。")
+    received = 0
+    digest = hashlib.sha256()
+    while data := package.read(min(_CHUNK, size - received + 1)):
+        received += len(data)
+        if received > size:
+            raise UpdateError("更新包超过声明大小。")
+        digest.update(data)
+    _check_digest(received, digest, size, expected)
+
+
 def verify_package(path, size, sha256):
     """Verify a local package using the expected byte count and SHA-256."""
     expected = _expected_package(size, sha256)
-    path = _single_file(path)
-    with path.open("rb") as package:
-        if os.fstat(package.fileno()).st_size != size:
-            raise UpdateError("更新包大小与声明不符。")
-        received = 0
-        digest = hashlib.sha256()
-        while data := package.read(min(_CHUNK, size - received + 1)):
-            received += len(data)
-            if received > size:
-                raise UpdateError("更新包超过声明大小。")
-            digest.update(data)
-        _check_digest(received, digest, size, expected)
+    with _single_file(path).open("rb") as package:
+        _verify_package_stream(package, size, expected)
 
 
 def _bounded_zip_directory(package):
@@ -433,7 +438,7 @@ def _bounded_zip_directory(package):
     return count
 
 
-def _zip_member(info):
+def _zip_member(info, executable):
     name = info.orig_filename  # filename alone may silently truncate at NUL.
     directory = name.endswith("/")
     parts = tuple((name[:-1] if directory else name).split("/"))
@@ -441,10 +446,13 @@ def _zip_member(info):
             or any(not _valid_win_component(part) for part in parts)):
         raise UpdateError(f"更新包内含不安全的 Windows 路径：{name!r}")
     root = parts[0]
-    if root != RUNTIME_DIR and not (root in (APP_EXE, HELPER_EXE) and len(parts) == 1 and not directory):
+    if root != RUNTIME_DIR and not (root == executable and len(parts) == 1 and not directory):
         raise UpdateError(f"更新包内含非托管路径：{name!r}")
     if root == RUNTIME_DIR and len(parts) == 1 and not directory:
         raise UpdateError("更新包运行时必须是目录。")
+    if (executable == APP_EXE and root == RUNTIME_DIR and len(parts) > 1
+            and parts[1].upper().casefold() == "updater-runtime"):
+        raise UpdateError(f"主程序更新包禁止包含更新器运行时：{name!r}")
     mode = stat.S_IFMT(info.external_attr >> 16)
     if (mode not in (0, stat.S_IFDIR if directory else stat.S_IFREG)
             or info.external_attr & (_REPARSE | (0 if directory else stat.FILE_ATTRIBUTE_DIRECTORY))):
@@ -466,7 +474,7 @@ def _zip_member(info):
     return parts, directory
 
 
-def _plan_zip(archive, count):
+def _plan_zip(archive, count, executable, manifest):
     infos = archive.infolist()
     if len(infos) != count:
         raise UpdateError("更新包 ZIP 条目计数无效。")
@@ -475,7 +483,7 @@ def _plan_zip(archive, count):
     seen = set()
     total = 0
     for info in infos:
-        parts, directory = _zip_member(info)
+        parts, directory = _zip_member(info, executable)
         key = tuple(part.upper().casefold() for part in parts)
         if key in seen:
             raise UpdateError(f"更新包内含重复路径：{info.orig_filename!r}")
@@ -489,7 +497,7 @@ def _plan_zip(archive, count):
             raise UpdateError("更新包解压后超过大小上限。")
         if not directory:
             files[parts] = info
-    for required in ((APP_EXE,), (HELPER_EXE,), _BASE_LIBRARY, _MANIFEST):
+    for required in ((executable,), _BASE_LIBRARY, manifest):
         if required not in files or files[required].file_size == 0:
             raise UpdateError(f"更新包缺少必要文件：{'/'.join(required)}")
     return sorted((parts for parts, is_dir in paths.values() if is_dir), key=len), files
@@ -502,11 +510,11 @@ def _manifest_pairs(pairs):
     return result
 
 
-def _verify_manifest(archive, info, version):
+def _verify_manifest(archive, info, expected):
     if info.file_size > _MAX_MANIFEST_BYTES:
         raise UpdateError("更新包清单大小无效。")
     data = json.loads(archive.read(info).decode("utf-8-sig"), object_pairs_hook=_manifest_pairs)
-    if (not isinstance(data, dict) or data != {"version": version, "protocol": 1}
+    if (not isinstance(data, dict) or data != expected
             or type(data["protocol"]) is not int):
         raise UpdateError("更新包清单版本或安装协议不匹配。")
 
@@ -528,50 +536,77 @@ def _pe_machine(path):
     raise UpdateError(f"更新文件不是受支持的 Windows PE 可执行文件：{path.name}")
 
 
-def _verify_executables(stage):
-    machine = _pe_machine(stage / APP_EXE)
-    if (_pe_machine(stage / HELPER_EXE) != machine
-            or os.name == "nt" and _pe_machine(Path(sys.executable)) != machine):
-        raise UpdateError("更新包程序和更新器的架构与当前程序不匹配。")
-
-
-def extract_package(path, stage, *, version):
-    """Extract a verified archive into a new private stage, never following archive names blindly."""
-    path = _single_file(path)
-    stage = _absolute(stage)
-    _check_absent(stage)
+def _app_manifest(version):
     if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
         raise UpdateError("更新包版本格式无效。")
+    return {"version": version, "protocol": UPDATE_PROTOCOL}
+
+
+@contextmanager
+def _checked_zip(package, executable, manifest, expected):
+    try:
+        count = _bounded_zip_directory(package)
+        with zipfile.ZipFile(package) as archive:
+            directories, files = _plan_zip(archive, count, executable, manifest)
+            _verify_manifest(archive, files[manifest], expected)
+            yield archive, directories, files
+    except (zipfile.BadZipFile, ValueError, EOFError, NotImplementedError,
+            struct.error, zlib.error, RecursionError) as exc:
+        raise UpdateError("更新包 ZIP 或清单格式无效。") from exc
+
+
+def validate_package(path, *, version):
+    """Check the app ZIP metadata and manifest without extracting payloads or verifying SHA-256."""
+    expected = _app_manifest(version)
+    with _single_file(path).open("rb") as package:
+        with _checked_zip(package, APP_EXE, _APP_MANIFEST, expected):
+            pass
+
+
+def _extract_zip(package, stage, executable, manifest, expected):
+    stage = _absolute(stage)
+    _check_absent(stage)
     created = finished = False
     try:
-        with path.open("rb") as package:
-            count = _bounded_zip_directory(package)
-            with zipfile.ZipFile(package) as archive:
-                directories, files = _plan_zip(archive, count)
-                _verify_manifest(archive, files[_MANIFEST], version)
-                stage.mkdir()
-                created = True
-                # Each destination is created exactly once, without exist_ok.
-                # Windows 8.3 aliases cannot silently satisfy a second mkdir.
-                for parts in directories:
-                    stage.joinpath(*parts).mkdir()
-                for parts, info in files.items():
-                    with archive.open(info) as src, stage.joinpath(*parts).open("xb") as dst:
-                        remaining = info.file_size
-                        while data := src.read(min(_CHUNK, remaining + 1)):
-                            remaining -= len(data)
-                            if remaining < 0:
-                                raise UpdateError("更新包解压超过声明大小。")
-                            dst.write(data)
-                        if remaining != 0:
-                            raise UpdateError("更新包解压大小与声明不符。")
-                _verify_executables(stage)
+        with _checked_zip(package, executable, manifest, expected) as (archive, directories, files):
+            stage.mkdir()
+            created = True
+            # Each destination is created exactly once, without exist_ok.
+            # Windows 8.3 aliases cannot silently satisfy a second mkdir.
+            for parts in directories:
+                stage.joinpath(*parts).mkdir()
+            for parts, info in files.items():
+                with archive.open(info) as src, stage.joinpath(*parts).open("xb") as dst:
+                    remaining = info.file_size
+                    while data := src.read(min(_CHUNK, remaining + 1)):
+                        remaining -= len(data)
+                        if remaining < 0:
+                            raise UpdateError("更新包解压超过声明大小。")
+                        dst.write(data)
+                    if remaining != 0:
+                        raise UpdateError("更新包解压大小与声明不符。")
+            machine = _pe_machine(stage / executable)
+            if os.name == "nt" and _pe_machine(Path(sys.executable)) != machine:
+                raise UpdateError(f"{executable} 的架构与当前程序不匹配。")
         finished = True
-    except (zipfile.BadZipFile, ValueError, EOFError, NotImplementedError, zlib.error, RecursionError) as exc:
-        raise UpdateError("更新包 ZIP 或清单格式无效。") from exc
     finally:
         if created and not finished:
             shutil.rmtree(validate_plain_tree(stage))
+
+
+def extract_package(path, stage, *, version):
+    """Extract a previously hash-verified app ZIP to a new private stage."""
+    expected = _app_manifest(version)
+    with _single_file(path).open("rb") as package:
+        _extract_zip(package, stage, APP_EXE, _APP_MANIFEST, expected)
+
+
+def extract_helper_package(path, stage, *, size, sha256):
+    """Hash-verify the standalone updater ZIP and extract it without reopening the source path."""
+    expected = _expected_package(size, sha256)
+    with _single_file(path).open("rb") as package:
+        _verify_package_stream(package, size, expected)
+        _extract_zip(package, stage, HELPER_EXE, _HELPER_MANIFEST, {"protocol": UPDATE_PROTOCOL})
 
 
 def _transaction_paths(root, stage, backup):
@@ -617,9 +652,8 @@ def apply_package(root, stage, backup):
     # Unpublish the launcher first. Windows refuses this rename while the old
     # image is in use (including by a startup yet to acquire its shared lock).
     _rename_new(root / APP_EXE, backup / APP_EXE)
-    for name, _ in _ITEMS[:-1]:
-        _rename_new(root / name, backup / name)
-        _rename_new(stage / name, root / name)
+    _rename_new(root / RUNTIME_DIR, backup / RUNTIME_DIR)
+    _rename_new(stage / RUNTIME_DIR, root / RUNTIME_DIR)
     _rename_new(stage / APP_EXE, root / APP_EXE)
 
 
@@ -637,15 +671,13 @@ def rollback_package(root, stage, backup):
         if current is not None and staged is not None:
             raise UpdateError(f"更新回滚发现不一致的暂存状态：{name}")
         saved[name], active[name] = old, current
-    if any(name != APP_EXE for name in saved) and APP_EXE not in saved:
+    if RUNTIME_DIR in saved and APP_EXE not in saved:
         raise UpdateError("更新回滚缺少原启动程序备份。")
     if active.get(APP_EXE) is not None:
         _rename_new(active[APP_EXE], stage / APP_EXE)
-    for name, _ in reversed(_ITEMS[:-1]):
-        if name not in saved:
-            continue
-        if active[name] is not None:
-            _rename_new(active[name], stage / name)
-        _rename_new(saved[name], root / name)
+    if RUNTIME_DIR in saved:
+        if active[RUNTIME_DIR] is not None:
+            _rename_new(active[RUNTIME_DIR], stage / RUNTIME_DIR)
+        _rename_new(saved[RUNTIME_DIR], root / RUNTIME_DIR)
     if APP_EXE in saved:
         _rename_new(saved[APP_EXE], root / APP_EXE)
