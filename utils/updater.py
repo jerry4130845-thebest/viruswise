@@ -97,8 +97,6 @@ def _win_get_attributes():
 
 def _checked_lstat(path, kind=None):
     if os.name == "nt":
-        # Some non-name-surrogate reparse tags are followed by Python's lstat.
-        # Check the raw attributes first without opening the reparse target.
         import ctypes
         attrs = _win_get_attributes()(str(path))
         if attrs == 0xFFFFFFFF:
@@ -242,9 +240,6 @@ def installation_lock(root, *, exclusive=False):
                                    w.HANDLE, c.POINTER(FileInformation))
 
     descriptor = c.c_void_p()
-    # Let admins, SYSTEM and the file owner lock for writes. Other
-    # authenticated users can take a shared read lock but cannot write to the
-    # file. OPEN_ALWAYS does not change an existing ACL.
     if not convert("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)(A;;FR;;;AU)", 1, c.byref(descriptor), None):
         raise UpdateError("无法初始化安装锁权限。") from c.WinError(c.get_last_error())
     try:
@@ -294,8 +289,6 @@ class _AssetRedirect(HTTPRedirectHandler):
     max_repeats = 1
 
     def http_error_302(self, req, fp, code, msg, headers):
-        # urllib normally drains the entire redirect body before following it.
-        # The body is irrelevant; close this connection without reading it.
         fp.close()
         return super().http_error_302(req, fp, code, msg, headers)
 
@@ -404,8 +397,6 @@ def verify_package(path, size, sha256):
 
 
 def _bounded_zip_directory(package):
-    # Cap the central directory before ZipFile allocates and parses it. This
-    # protocol needs neither ZIP64 end records nor split/self-extracting ZIPs.
     size = os.fstat(package.fileno()).st_size
     if not 22 <= size <= MAX_PACKAGE_BYTES:
         raise UpdateError("更新包 ZIP 大小无效或超过上限。")
@@ -571,8 +562,6 @@ def _extract_zip(package, stage, executable, manifest, expected):
         with _checked_zip(package, executable, manifest, expected) as (archive, directories, files):
             stage.mkdir()
             created = True
-            # Each destination is created exactly once, without exist_ok.
-            # Windows 8.3 aliases cannot silently satisfy a second mkdir.
             for parts in directories:
                 stage.joinpath(*parts).mkdir()
             for parts, info in files.items():
@@ -610,8 +599,6 @@ def extract_helper_package(path, stage, *, size, sha256):
 
 
 def _transaction_paths(root, stage, backup):
-    # Resolve only after the no-reparse walk, so short names cannot alias a
-    # protected component or disguise overlapping transaction directories.
     root, stage, backup = (safe_path(p, kind="dir").resolve(strict=True) for p in (root, stage, backup))
     runtime = root / RUNTIME_DIR
     if (root.is_relative_to(stage) or root.is_relative_to(backup)
@@ -636,8 +623,6 @@ def _managed_item(parent, name, kind, *, optional=False):
 
 def _rename_new(source, target):
     _check_absent(target)
-    # os.rename is no-overwrite on Windows, and never falls back to copying
-    # across volumes. The parent directories are trusted and locked by caller.
     source.rename(target)
 
 
@@ -649,8 +634,6 @@ def apply_package(root, stage, backup):
     for name, kind in _ITEMS:
         _managed_item(root, name, kind)
         _managed_item(stage, name, kind)
-    # Unpublish the launcher first. Windows refuses this rename while the old
-    # image is in use (including by a startup yet to acquire its shared lock).
     _rename_new(root / APP_EXE, backup / APP_EXE)
     _rename_new(root / RUNTIME_DIR, backup / RUNTIME_DIR)
     _rename_new(stage / RUNTIME_DIR, root / RUNTIME_DIR)

@@ -24,7 +24,6 @@ _DEFAULTS = {
 
 
 def config_path():
-    # Match utils.paths exactly, without its import-time mkdir side effects.
     override = globals().get('CONFIG_FILE')
     if override is not None:
         return os.fspath(override)
@@ -38,8 +37,7 @@ def _config_lines(path):
         with open(path, 'r', encoding='utf-8-sig') as stream:
             return stream.readlines()
     except UnicodeDecodeError:
-        # Older GUI versions wrote with the Windows locale encoding. New saves
-        # use UTF-8, but reading an existing local-codepage config must still work.
+
         with open(path, 'r') as stream:
             return stream.readlines()
 
@@ -112,8 +110,6 @@ def _write_lock(path):
                         lock.seek(0)
                         msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
                     except OSError:
-                        # Closing the handle also releases the lock. A cleanup
-                        # error must not turn an already committed save into failure.
                         pass
             else:
                 import fcntl
@@ -155,11 +151,6 @@ def _atomic_save(config, path, before_replace=None):
 
 
 def save_config(config, *, path=None, strict=False):
-    """Save preferences, retaining disk-owned metadata; return success.
-
-    strict=True propagates errors. Recording and update-check timestamps are
-    changed only by their dedicated commits, never by a cached GUI dictionary.
-    """
     path = path or config_path()
     try:
         with _write_lock(path):
@@ -177,10 +168,6 @@ def save_config(config, *, path=None, strict=False):
 
 
 def commit_whitelist_recording(recorded_at, snapshot_id, *, path=None, before_commit=None):
-    """Recorder-only commit, called AFTER durable whitelist save and >=30s.
-
-    No cached preference dict is written back. Failures propagate to callers.
-    """
     if isinstance(recorded_at, bool) or not isinstance(recorded_at, (int, float)) or not math.isfinite(recorded_at) or recorded_at <= 0:
         raise ValueError('Invalid recording success timestamp')
     if not isinstance(snapshot_id, str) or len(snapshot_id) != 64 or any(c not in '0123456789abcdef' for c in snapshot_id):
@@ -195,16 +182,8 @@ def commit_whitelist_recording(recorded_at, snapshot_id, *, path=None, before_co
 
 
 def claim_update_check(checked_at=None, *, force=False, path=None):
-    """Atomically reserve an attempt; return (claimed, last_attempt_timestamp).
-
-    Failed HTTP attempts also count. Call this before networking, off the GUI
-    thread. A future timestamp (clock rollback) is repaired by a new attempt.
-    No stale preferences or whitelist metadata are written back.
-    """
     path = path or config_path()
     with _write_lock(path):
-        # Take the clock inside the lock: queued workers must not mistake a
-        # slightly newer writer's timestamp for a system clock rollback.
         checked_at = time.time() if checked_at is None else checked_at
         if (isinstance(checked_at, bool) or not isinstance(checked_at, (int, float))
                 or not math.isfinite(checked_at) or checked_at <= 0):

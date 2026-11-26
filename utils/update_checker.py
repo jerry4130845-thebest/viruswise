@@ -78,7 +78,6 @@ def _auto_update_asset(release, tag):
 
 
 def _fetch_latest_release():
-    # Public API only: no application API keys are added to this request.
     with requests.get(
             LATEST_RELEASE_API,
             headers={"Accept": "application/vnd.github+json",
@@ -103,7 +102,6 @@ def _fetch_latest_release():
     except ValueError:
         return UpdateCheckResult("unsupported_tag", "当前 Release 标签不符合 Vx.y.z 格式，暂时无法判断更新。")
     version = tag[1:]
-    # Build a trusted URL ourselves; do not open an arbitrary API-provided URL.
     url = f"{RELEASES_URL}/tag/{tag}"
     if latest > parse_version(CURRENT_VERSION):
         return UpdateCheckResult("available", latest_version=version, release_url=url,
@@ -112,12 +110,6 @@ def _fetch_latest_release():
 
 
 def check_for_updates(*, force=False, path=None):
-    """Run in a worker. Manual checks bypass the interval, not the write lock.
-
-    Persist attempts before HTTP, including failures. If persistence fails,
-    don't issue HTTP: otherwise restart loops could hammer the GitHub API.
-    The optional path supports isolated verification without user config I/O.
-    """
     try:
         claimed, checked_at = claim_update_check(force=force, path=path)
     except (OSError, UnicodeError, ValueError) as exc:

@@ -1,5 +1,3 @@
-"""Loss-averse quarantine: publish a verified copy before removing a source."""
-
 import ctypes
 from datetime import datetime, timezone
 import hashlib
@@ -30,7 +28,6 @@ def _require_regular(info):
 
 
 def _open_source(path):
-    """Return (file, may_delete). Windows denies concurrent write/delete opens."""
     if os.name != "nt":
         # There is no portable unlink-by-open-handle. Preserve the source here.
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
